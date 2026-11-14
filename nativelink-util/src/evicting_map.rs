@@ -148,6 +148,53 @@ struct State<
 
 type RemoveFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
+/// The cleanup an insertion owes the entries it replaced or evicted: their
+/// remove callbacks, then their `unref()`. See
+/// [`EvictingMap::insert_if_deferring_cleanup`].
+#[must_use = "displaced entries are only unreferenced when the cleanup is run"]
+pub struct InsertCleanup<T> {
+    items_to_unref: Vec<T>,
+    removal_futures: Vec<RemoveFuture>,
+}
+
+impl<T> Default for InsertCleanup<T> {
+    fn default() -> Self {
+        Self {
+            items_to_unref: Vec::new(),
+            removal_futures: Vec::new(),
+        }
+    }
+}
+
+impl<T> Debug for InsertCleanup<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("InsertCleanup")
+            .field("items_to_unref", &self.items_to_unref.len())
+            .field("removal_futures", &self.removal_futures.len())
+            .finish()
+    }
+}
+
+impl<T: LenEntry + Send + Sync> InsertCleanup<T> {
+    /// Runs the remove callbacks, then unrefs the displaced entries outside
+    /// the map lock. Returns one of the displaced entries (the first whose
+    /// `unref()` completes), or `None` if the insertion displaced nothing.
+    pub async fn run(self) -> Option<T> {
+        let mut futures: FuturesUnordered<_> = self.removal_futures.into_iter().collect();
+        while futures.next().await.is_some() {}
+
+        let futures: FuturesUnordered<_> = self
+            .items_to_unref
+            .into_iter()
+            .map(|item| async move {
+                item.unref().await;
+                item
+            })
+            .collect();
+        futures.collect::<Vec<_>>().await.into_iter().next()
+    }
+}
+
 impl<
     K: Ord + Hash + Eq + Clone + Debug + Send + Sync + Borrow<Q>,
     Q: Ord + Hash + Eq + Debug + Sync,
@@ -787,6 +834,42 @@ where
     where
         F: FnOnce(&T, &T) -> bool + Send,
     {
+        let (inserted, cleanup) =
+            self.insert_with_time_if_deferring_cleanup(key, data, cond, seconds_since_anchor);
+        (inserted, cleanup.run().await)
+    }
+
+    /// [`Self::insert_if`] without waiting for the cleanup of the entries the
+    /// insertion replaced or evicted. The returned flag is `true` if `data`
+    /// was inserted (the key was absent or `cond` accepted it); the eviction
+    /// that follows the insertion may already have removed it again, in which
+    /// case it is among the displaced entries. The displaced entries are
+    /// unreferenced only when the returned [`InsertCleanup`] is run. This
+    /// lets a caller that holds a resource the cleanup could wait on (for
+    /// example, permits that `unref()` also needs) release it between the
+    /// two steps.
+    pub fn insert_if_deferring_cleanup<F>(
+        &self,
+        key: K,
+        data: T,
+        cond: F,
+    ) -> (bool, InsertCleanup<T>)
+    where
+        F: FnOnce(&T, &T) -> bool + Send,
+    {
+        self.insert_with_time_if_deferring_cleanup(key, data, cond, self.elapsed_seconds())
+    }
+
+    fn insert_with_time_if_deferring_cleanup<F>(
+        &self,
+        key: K,
+        data: T,
+        cond: F,
+        seconds_since_anchor: i32,
+    ) -> (bool, InsertCleanup<T>)
+    where
+        F: FnOnce(&T, &T) -> bool + Send,
+    {
         let (items_to_unref, removal_futures) = {
             let mut state = self.state.lock();
 
@@ -794,25 +877,20 @@ where
             if let Some(old_entry) = state.lru.get(key.borrow())
                 && !cond(&old_entry.data, &data)
             {
-                return (false, None);
+                return (false, InsertCleanup::default());
             }
 
             self.inner_insert_many(&mut state, [(key, data)], seconds_since_anchor)
         };
 
         self.flush_cache_size_metrics();
-        let mut futures: FuturesUnordered<_> = removal_futures.into_iter().collect();
-        while futures.next().await.is_some() {}
-
-        // Unref items outside of lock
-        let futures: FuturesUnordered<_> = items_to_unref
-            .into_iter()
-            .map(|item| async move {
-                item.unref().await;
-                item
-            })
-            .collect();
-        (true, futures.collect::<Vec<_>>().await.into_iter().next())
+        (
+            true,
+            InsertCleanup {
+                items_to_unref,
+                removal_futures,
+            },
+        )
     }
 
     /// Same as `insert()`, but optimized for multiple inserts.
