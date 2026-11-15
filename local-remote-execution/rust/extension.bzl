@@ -30,7 +30,7 @@ def _lre_rs_impl(_mctx):
     new_local_repository(
         name = "lre-rs-stable-aarch64-darwin",
         build_file = "@local-remote-execution//rust:aarch64-darwin.BUILD.bazel",
-        path = "/nix/store/0ivm7k16v2x6gv292j95mwaksn34h64j-rust-default-1.97.1",
+        path = "/nix/store/pxg7myic5za5l7cs9132v6sld2rhpzya-rust-default-1.100.0",
     )
     new_local_repository(
         name = "lre-rs-nightly-aarch64-darwin",
@@ -40,7 +40,7 @@ def _lre_rs_impl(_mctx):
     new_local_repository(
         name = "lre-rs-stable-aarch64-linux",
         build_file = "@local-remote-execution//rust:aarch64-linux.BUILD.bazel",
-        path = "/nix/store/38rjkxgh6415377x0vr9p2yrhcrwz3vh-rust-default-1.97.1",
+        path = "/nix/store/m4qv7x7vn9xm6rhrvf55g3yawgas5d25-rust-default-1.100.0",
     )
     new_local_repository(
         name = "lre-rs-nightly-aarch64-linux",
@@ -50,7 +50,7 @@ def _lre_rs_impl(_mctx):
     new_local_repository(
         name = "lre-rs-stable-x86_64-linux",
         build_file = "@local-remote-execution//rust:x86_64-linux.BUILD.bazel",
-        path = "/nix/store/16iqjcbihzjbj6hdr7iqwdqzgwrwgrzr-rust-default-1.97.1",
+        path = "/nix/store/x4br9x418yby2q80rncf0nbf30kmms22-rust-default-1.100.0",
     )
     new_local_repository(
         name = "lre-rs-nightly-x86_64-linux",

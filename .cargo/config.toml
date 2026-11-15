@@ -1,0 +1,6 @@
+# Cargo 1.100+ filters newly resolved registry versions; existing locks remain valid.
+[registry]
+global-min-publish-age = "14 days"
+
+[resolver]
+incompatible-publish-age = "deny"

@@ -159,6 +159,10 @@
                 p.libiconv
               ];
             CARGO_BUILD_TARGET = targetArch;
+            # Crane uses a private Cargo home/source closure, so do not rely on
+            # the developer's user-level configuration for fresh resolution.
+            CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE = "14 days";
+            CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE = "deny";
           }
           // (pkgs.lib.optionalAttrs (isLinuxTarget && !isCrossCompile) {
             # customClang is only defined for the host compiler, so doesn't work for cross-compiling

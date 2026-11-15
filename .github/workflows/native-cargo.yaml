@@ -32,7 +32,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, windows-2022]
-        toolchain: [stable]
+        toolchain: ["1.100.0"]
     name: ${{ matrix.os }} / ${{ matrix.toolchain }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -48,7 +48,7 @@ jobs:
         if: matrix.os == 'ubuntu-24.04'
 
       - name: Set up Rust toolchain
-        run: rustup update && rustup default ${{ matrix.toolchain }}
+        run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal && rustup default ${{ matrix.toolchain }}
 
       - name: Rust cache
         uses: >- # v2.9.1

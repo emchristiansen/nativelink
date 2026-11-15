@@ -1,36 +1,32 @@
-import re
-import subprocess
-import requests
-import sys
 import pathlib
+import re
+import sys
 
-module_bazel_path = sys.argv[1]
-cache_dir = pathlib.Path(__file__).parent.joinpath("cache")
-cache_dir.mkdir(exist_ok=True)
+import requests
 
-original = open(module_bazel_path).read()
+module_bazel_path = pathlib.Path(sys.argv[1])
+original = module_bazel_path.read_text()
 begin_shas = re.search("# BEGIN SHAS\n", original).end() # pyright: ignore[reportOptionalMemberAccess]
 end_shas = re.search("\n        # END SHAS", original).start() # pyright: ignore[reportOptionalMemberAccess]
-print(begin_shas, end_shas)
 sha_pattern = re.compile(r"\"(.+\.tar\.xz)\": \"([0-9a-f]+)\"")
 
-results = ""
-
+results = []
 for entry in sha_pattern.finditer(original, begin_shas, end_shas):
-    short_url, hash = entry.groups()
-    cache_path = cache_dir.joinpath(short_url.replace("/", "_"))
-    if not cache_path.exists():
-        full_url = f"https://static.rust-lang.org/dist/{short_url}"
-        print("getting", full_url, cache_path)
-        req = requests.get(full_url)
-        with cache_path.open("wb") as f:
-            f.write(req.content)
-    sha256_cmd = subprocess.check_output(["sha256sum", cache_path.as_posix()], encoding="utf-8")
-    sha256 = sha256_cmd.split(" ")[0]
-    if results != "":
-        results += "\n"
-    results += f"        \"{short_url}\": \"{sha256}\","
+    short_url, _ = entry.groups()
+    # Rust publishes official checksums alongside each archive. Downloading the
+    # archives themselves just to refresh this metadata wastes gigabytes.
+    checksum_url = f"https://static.rust-lang.org/dist/{short_url}.sha256"
+    print("getting", checksum_url)
+    response = requests.get(checksum_url, timeout=30)
+    response.raise_for_status()
+    checksum = re.fullmatch(r"([0-9a-f]{64})\s+\*?(\S+)\s*", response.text)
+    if checksum is None or checksum[2] != pathlib.PurePosixPath(short_url).name:
+        raise ValueError(f"Invalid checksum or filename from {checksum_url}")
+    results.append(f"        \"{short_url}\": \"{checksum[1]}\",")
 
-revised = original[:begin_shas] + results + original[end_shas:]
-with open(module_bazel_path, "w") as f:
-    f.write(revised)
+if not results:
+    raise ValueError(f"No Rust archive entries in {module_bazel_path}")
+
+# Do not replace any metadata until every official checksum has been validated.
+revised = original[:begin_shas] + "\n".join(results) + original[end_shas:]
+module_bazel_path.write_text(revised)
