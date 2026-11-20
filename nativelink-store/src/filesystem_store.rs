@@ -580,6 +580,35 @@ impl<Fe: FileEntry> RetirementQueue<Fe> {
         Duration::from_millis(self.report_every_ms.load(Ordering::Relaxed))
     }
 
+    /// Logs a running drain's backlog at info level. `pending` is the kind
+    /// of the unit the drain is waiting for and when it started, if it is
+    /// waiting for one.
+    fn report_backlog(
+        &self,
+        started: Instant,
+        units_run: u64,
+        unref_bytes: u64,
+        pending: Option<(&'static str, Instant)>,
+    ) {
+        let backlog = self.accounting();
+        let (pending_unit, pending_ms) = match pending {
+            Some((kind, since)) => (kind, since.elapsed().as_millis()),
+            None => ("none", 0),
+        };
+        info!(
+            store = %self.content_path,
+            units_run,
+            unref_bytes,
+            elapsed_ms = started.elapsed().as_millis(),
+            pending_unit = %pending_unit,
+            pending_ms,
+            queued_units = backlog.queued_units,
+            queued_bytes = backlog.queued_bytes,
+            detached_in_flight = backlog.detached_in_flight,
+            "Filesystem store retirement backlog"
+        );
+    }
+
     fn accounting(&self) -> RetirementAccounting {
         let state = self.state.lock();
         RetirementAccounting {
@@ -716,7 +745,16 @@ impl<Fe: FileEntry> RetirementDrain<Fe> {
     /// ([`RETIREMENT_REPORT_EVERY`] by default) logs the backlog at info level
     /// once per interval while it runs, and a summary when it catches up, so
     /// a drain that has fallen behind is visible in the journal before it
-    /// shows as disk use. Shorter runs log their summary at debug level.
+    /// shows as disk use. The interval is timed while a unit is pending, not
+    /// only between units: a unit stalled in the retirement admission, a
+    /// rename or a remove callback still produces a report per interval,
+    /// naming the pending unit's kind and how long it has been pending.
+    /// Reporting never cancels or restarts the unit. Shorter runs log their
+    /// summary at debug level.
+    ///
+    /// "Caught up" means the drain's queue is empty. Unrefs handed to
+    /// detached tasks may still be pending, and deleting renamed files is a
+    /// separate queue: it is not a receipt that the store's files are gone.
     async fn run(mut self) {
         let started = Instant::now();
         let mut last_report = started;
@@ -735,13 +773,45 @@ impl<Fe: FileEntry> RetirementDrain<Fe> {
                 };
                 self.current = Some(unit);
             }
-            let completed_unref = match self.current.as_mut() {
-                Some(RetirementUnit::Callback(callback)) => {
-                    callback.as_mut().await;
-                    None
-                }
-                Some(RetirementUnit::Unref(entry)) => Some(entry.try_unref().await),
-                None => unreachable!("a unit was just taken"),
+            let unit_started = Instant::now();
+            let completed_unref = {
+                // `self.current` stays in place while its unit runs, so a drain
+                // dropped meanwhile puts it back on the queue (see `Drop`).
+                let (pending_unit, unit) = match self.current.as_mut() {
+                    Some(RetirementUnit::Callback(callback)) => (
+                        "callback",
+                        futures::future::Either::Left(async move {
+                            callback.as_mut().await;
+                            None
+                        }),
+                    ),
+                    Some(RetirementUnit::Unref(entry)) => (
+                        "unref",
+                        futures::future::Either::Right(
+                            async move { Some(entry.try_unref().await) },
+                        ),
+                    ),
+                    None => unreachable!("a unit was just taken"),
+                };
+                tokio::pin!(unit);
+                let completed_unref = loop {
+                    let next_report =
+                        tokio::time::Instant::from_std(last_report + self.queue.report_every());
+                    tokio::select! {
+                        biased;
+                        completed_unref = &mut unit => break completed_unref,
+                        () = tokio::time::sleep_until(next_report) => {
+                            last_report = Instant::now();
+                            self.queue.report_backlog(
+                                started,
+                                units_run,
+                                unref_bytes,
+                                Some((pending_unit, unit_started)),
+                            );
+                        }
+                    }
+                };
+                completed_unref
             };
             let unit = self.current.take();
             if let (Some(RetirementUnit::Unref(entry)), Some(unrefed)) = (unit, completed_unref) {
@@ -755,29 +825,22 @@ impl<Fe: FileEntry> RetirementDrain<Fe> {
             units_run += 1;
             if last_report.elapsed() >= self.queue.report_every() {
                 last_report = Instant::now();
-                let backlog = self.queue.accounting();
-                info!(
-                    store = %self.queue.content_path,
-                    units_run,
-                    unref_bytes,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    queued_units = backlog.queued_units,
-                    queued_bytes = backlog.queued_bytes,
-                    detached_in_flight = backlog.detached_in_flight,
-                    "Filesystem store retirement backlog"
-                );
+                self.queue
+                    .report_backlog(started, units_run, unref_bytes, None);
             }
         }
     }
 
     fn report_caught_up(&self, started: Instant, units_run: u64, unref_bytes: u64) {
         let elapsed = started.elapsed();
+        let detached_in_flight = self.queue.accounting().detached_in_flight;
         if elapsed >= self.queue.report_every() {
             info!(
                 store = %self.queue.content_path,
                 units_run,
                 unref_bytes,
                 elapsed_ms = elapsed.as_millis(),
+                detached_in_flight,
                 "Filesystem store retirement drain caught up"
             );
         } else {
@@ -786,6 +849,7 @@ impl<Fe: FileEntry> RetirementDrain<Fe> {
                 units_run,
                 unref_bytes,
                 elapsed_ms = elapsed.as_millis(),
+                detached_in_flight,
                 "Filesystem store retirement drain caught up"
             );
         }
@@ -2987,7 +3051,17 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     /// Sets how long a retirement drain runs between backlog reports (see
     /// [`RetirementDrain::run`]), so a test can see a report without waiting
     /// [`RETIREMENT_REPORT_EVERY`].
+    ///
+    /// # Panics
+    ///
+    /// If `every` is shorter than a millisecond: a drain waiting for a unit
+    /// reports once per interval, and a zero interval would report without
+    /// pause.
     pub fn set_retirement_report_interval_for_test(&self, every: Duration) {
+        assert!(
+            every >= Duration::from_millis(1),
+            "retirement report interval {every:?} is shorter than 1ms"
+        );
         self.retirement.report_every_ms.store(
             u64::try_from(every.as_millis()).unwrap_or(u64::MAX),
             Ordering::Relaxed,

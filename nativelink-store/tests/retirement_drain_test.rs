@@ -213,9 +213,14 @@ async fn writes_return_while_their_eviction_batch_is_held() -> Result<(), Error>
 // the journal while it runs, and again when it has caught up; one that keeps
 // up within the interval logs neither at info level. Production exports no
 // metrics by default, so this is where a drain that has fallen behind shows.
+// The report must come while the drain is stalled on a unit, not only once
+// the unit has finished: here the first unit (the batch's first remove
+// callback or unref) waits for the retirement admission, and the report is
+// required before the admission is released.
 #[nativelink_test]
 async fn a_long_drain_reports_its_backlog() -> Result<(), Error> {
     const N: usize = 40;
+    const INTERVAL: Duration = Duration::from_millis(100);
     let _serial = SERIAL.lock().await;
     let dirs = dirs();
     let store = open_store(&dirs, N * SIZE, N * SIZE / 2).await?;
@@ -229,33 +234,62 @@ async fn a_long_drain_reports_its_backlog() -> Result<(), Error> {
         reports => Err(format!("{reports} info-level retirement reports")),
     });
 
-    // A batch whose drain runs past a zero interval reports while it runs.
-    store.set_retirement_report_interval_for_test(Duration::ZERO);
+    // A drain stalled on a unit past a nonzero interval reports while the
+    // unit is still pending.
+    store.set_retirement_report_interval_for_test(INTERVAL);
     let admission = store.hold_retirement_admission_for_test().await;
     for index in N + 1..2 * N {
         write(&store, index).await?;
     }
     let held = store.retirement_accounting();
     assert!(held.queued_units > 0, "a batch is queued: {held:?}");
-    drop(admission);
-    settle(&store).await;
     let store_field = format!("store={}", dirs.content);
-    logs_assert(|lines: &[&str]| {
-        let backlog = lines.iter().any(|line| {
+    let stalled_report = |lines: &[&str]| {
+        lines.iter().any(|line| {
             line.contains(" INFO ")
                 && line.contains("Filesystem store retirement backlog")
+                && (line.contains("pending_unit=callback") || line.contains("pending_unit=unref"))
                 && line.contains("queued_units=")
                 && line.contains(&store_field)
-        });
+        })
+    };
+    timeout(WAIT, async {
+        while !(logs_contain("pending_unit=callback") || logs_contain("pending_unit=unref")) {
+            sleep(INTERVAL / 4).await;
+        }
+    })
+    .await
+    .expect("no backlog report while the drain was stalled on a unit");
+    logs_assert(|lines: &[&str]| {
+        if stalled_report(lines) {
+            Ok(())
+        } else {
+            Err("the stalled-unit report lacks its level or fields".to_string())
+        }
+    });
+    // Still stalled: reporting neither ran nor dropped the pending unit.
+    let still_held = store.retirement_accounting();
+    assert!(
+        still_held.draining,
+        "the drain is still running: {still_held:?}"
+    );
+    assert!(
+        still_held.queued_bytes > 0,
+        "the pending unit's bytes are still queued: {still_held:?}"
+    );
+
+    drop(admission);
+    settle(&store).await;
+    let settled = store.retirement_accounting();
+    assert_eq!((settled.queued_units, settled.queued_bytes), (0, 0));
+    logs_assert(|lines: &[&str]| {
         let caught_up = lines.iter().any(|line| {
             line.contains(" INFO ") && line.contains("Filesystem store retirement drain caught up")
         });
-        if backlog && caught_up {
+        if caught_up {
             Ok(())
         } else {
-            Err(format!(
-                "backlog report {backlog}, caught-up report {caught_up}"
-            ))
+            Err("no caught-up report".to_string())
         }
     });
     Ok(())
