@@ -232,7 +232,7 @@ impl CacheLookupScheduler {
         // We need this spawn because we are returning a stream and this spawn will populate the stream's data.
         background_spawn!("cache_lookup_scheduler_add_action", async move {
             // If our spawn ever dies, we will remove the action from the inflight_cache_checks map.
-            let _scope_guard = scope_guard;
+            let mut scope_guard = Some(scope_guard);
 
             let unique_key = match &action_info.unique_qualifier {
                 ActionUniqueQualifier::Cacheable(unique_key) => unique_key,
@@ -260,6 +260,11 @@ impl CacheLookupScheduler {
                         let mut inflight_cache_checks = inflight_cache_checks.lock();
                         // We are ready to resolve the in-flight actions. We remove the
                         // in-flight actions from the map.
+                        // Disarm cleanup while holding the same lock used to remove
+                        // this generation, before a new same-key lookup can enter.
+                        scopeguard::ScopeGuard::into_inner(
+                            scope_guard.take().expect("lookup guard"),
+                        );
                         inflight_cache_checks.remove(unique_key)
                     };
                     let Some(pending_txs) = maybe_pending_txs else {
@@ -315,6 +320,8 @@ impl CacheLookupScheduler {
 
             let maybe_pending_txs = {
                 let mut inflight_cache_checks = inflight_cache_checks.lock();
+                // Disarm before releasing the key for the next generation.
+                scopeguard::ScopeGuard::into_inner(scope_guard.take().expect("lookup guard"));
                 inflight_cache_checks.remove(unique_key)
             };
             let Some(pending_txs) = maybe_pending_txs else {

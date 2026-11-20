@@ -27,16 +27,20 @@ use nativelink_config::stores::MemorySpec;
 use nativelink_error::{Code, Error, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
+use nativelink_metric::RootMetricsComponent;
 use nativelink_proto::build::bazel::remote::execution::v2::ActionResult as ProtoActionResult;
 use nativelink_scheduler::cache_lookup_scheduler::CacheLookupScheduler;
+use nativelink_scheduler::known_platform_property_provider::KnownPlatformPropertyProvider;
 use nativelink_scheduler::mock_scheduler::MockActionScheduler;
 use nativelink_store::memory_store::MemoryStore;
+use nativelink_util::action_messages::ActionInfo;
 use nativelink_util::action_messages::{
     ActionResult, ActionStage, ActionState, ActionUniqueQualifier, OperationId,
 };
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
+use nativelink_util::operation_state_manager::{ActionStateResult, ActionStateResultStream};
 use nativelink_util::operation_state_manager::{ClientStateManager, OperationFilter};
 use nativelink_util::store_trait::{
     RemoveItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
@@ -109,6 +113,245 @@ impl StoreDriver for AlwaysErrStore {
 }
 
 default_health_status_indicator!(AlwaysErrStore);
+
+/// Holds the second cache read open while the first lookup finishes.
+#[derive(Debug, MetricsComponent)]
+struct SecondReadGate {
+    #[metric(help = "Number of cache reads")]
+    reads: std::sync::atomic::AtomicU64,
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+#[async_trait]
+impl StoreDriver for SecondReadGate {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn has_with_results(
+        self: Pin<&Self>,
+        _keys: &[StoreKey<'_>],
+        _results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        Err(make_err!(Code::NotFound, "test cache miss"))
+    }
+    async fn update(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _reader: DropCloserReadHalf,
+        _size_info: UploadSizeInfo,
+    ) -> Result<u64, Error> {
+        Err(make_err!(Code::Unimplemented, "test store"))
+    }
+    async fn get_part(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _writer: &mut DropCloserWriteHalf,
+        _offset: u64,
+        _length: Option<u64>,
+    ) -> Result<(), Error> {
+        if self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+        }
+        Err(make_err!(Code::NotFound, "test cache miss"))
+    }
+    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+        self
+    }
+    fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+    fn register_remove_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn RemoveItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+default_health_status_indicator!(SecondReadGate);
+
+#[derive(Debug, MetricsComponent)]
+struct GatedUpstream {
+    #[metric(help = "Number of forwarded requests")]
+    calls: std::sync::atomic::AtomicU64,
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+    finished: tokio::sync::Semaphore,
+}
+impl RootMetricsComponent for GatedUpstream {}
+#[async_trait]
+impl KnownPlatformPropertyProvider for GatedUpstream {
+    async fn get_known_properties(&self, _instance_name: &str) -> Result<Vec<String>, Error> {
+        Ok(vec![])
+    }
+}
+#[async_trait]
+impl ClientStateManager for GatedUpstream {
+    async fn add_action(
+        &self,
+        _id: OperationId,
+        _action: Arc<ActionInfo>,
+    ) -> Result<Box<dyn ActionStateResult>, Error> {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            self.finished.add_permits(1);
+        }
+        Err(make_err!(Code::Unavailable, "injected upstream response"))
+    }
+    async fn filter_operations<'a>(
+        &'a self,
+        _filter: OperationFilter,
+    ) -> Result<ActionStateResultStream<'a>, Error> {
+        Err(make_err!(Code::Unimplemented, "test upstream"))
+    }
+}
+
+// A current-thread runtime ensures the old background task runs its guard to
+// completion before the awakened first client is polled after its sender fires.
+#[nativelink_test(flavor = "current_thread")]
+async fn finishing_old_lookup_does_not_cancel_new_same_key_lookup() -> Result<(), Error> {
+    let gate = Arc::new(SecondReadGate {
+        reads: std::sync::atomic::AtomicU64::new(0),
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let upstream = Arc::new(GatedUpstream {
+        calls: std::sync::atomic::AtomicU64::new(0),
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        finished: tokio::sync::Semaphore::new(0),
+    });
+    let scheduler = Arc::new(CacheLookupScheduler::new(
+        Store::new(gate.clone()),
+        upstream.clone(),
+    )?);
+    let action = make_base_action_info(UNIX_EPOCH, DigestInfo::new([77; 32], 123));
+    let first_scheduler = scheduler.clone();
+    let first_action = action.clone();
+    let first = tokio::spawn(async move {
+        first_scheduler
+            .add_action(OperationId::default(), first_action)
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        upstream.entered.acquire(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .forget();
+    let second_scheduler = scheduler.clone();
+    let second = tokio::spawn(async move {
+        second_scheduler
+            .add_action(OperationId::default(), action)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    upstream.release.add_permits(1);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), first)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    gate.release.add_permits(1);
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), second)
+        .await
+        .unwrap()
+        .unwrap()
+        .err()
+        .expect("upstream returns error");
+    assert_eq!(
+        error.code,
+        Code::Unavailable,
+        "second request must receive its own upstream response rather than a dropped sender: {error:?}"
+    );
+    Ok(())
+}
+
+#[nativelink_test(flavor = "current_thread")]
+async fn cancelling_first_caller_does_not_cancel_new_same_key_lookup() -> Result<(), Error> {
+    let gate = Arc::new(SecondReadGate {
+        reads: std::sync::atomic::AtomicU64::new(0),
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let upstream = Arc::new(GatedUpstream {
+        calls: std::sync::atomic::AtomicU64::new(0),
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        finished: tokio::sync::Semaphore::new(0),
+    });
+    let scheduler = Arc::new(CacheLookupScheduler::new(
+        Store::new(gate.clone()),
+        upstream.clone(),
+    )?);
+    let action = make_base_action_info(UNIX_EPOCH, DigestInfo::new([78; 32], 123));
+    let first_scheduler = scheduler.clone();
+    let first_action = action.clone();
+    let first = tokio::spawn(async move {
+        first_scheduler
+            .add_action(OperationId::default(), first_action)
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        upstream.entered.acquire(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .forget();
+    first.abort();
+    assert!(matches!(first.await, Err(ref error) if error.is_cancelled()));
+    let second_scheduler = scheduler.clone();
+    let second = tokio::spawn(async move {
+        second_scheduler
+            .add_action(OperationId::default(), action)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    upstream.release.add_permits(1);
+    // On the current-thread runtime the old background task runs from this
+    // signal through send and guard drop without another await.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        upstream.finished.acquire(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .forget();
+    gate.release.add_permits(1);
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), second)
+        .await
+        .unwrap()
+        .unwrap()
+        .err()
+        .expect("upstream returns error");
+    assert_eq!(
+        error.code,
+        Code::Unavailable,
+        "cancellation must not drop the later generation's sender: {error:?}"
+    );
+    Ok(())
+}
 
 struct TestContext {
     mock_scheduler: Arc<MockActionScheduler>,
