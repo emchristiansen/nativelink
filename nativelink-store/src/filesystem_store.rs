@@ -4472,7 +4472,7 @@ mod write_trace_tests {
                 "the caller may still take the answer up"
             );
             drop(caller);
-            assert_eq!(end_of(&trace), (WritePhase::Ended, Some(outcome.clone())));
+            assert_eq!(end_of(&trace), (WritePhase::Ended, Some(outcome)));
         }
     }
 
@@ -4496,7 +4496,7 @@ mod write_trace_tests {
                 "the check goes on without the caller"
             );
             trace.duplicate_checked(&answer);
-            assert_eq!(end_of(&trace), (WritePhase::Ended, Some(outcome.clone())));
+            assert_eq!(end_of(&trace), (WritePhase::Ended, Some(outcome)));
         }
     }
 

@@ -204,7 +204,7 @@ async fn writes_return_while_their_eviction_batch_is_held() -> Result<(), Error>
     }
     // Every victim's file left the content directory (renamed, then deleted).
     for victim in &digests[..N / 2 - 1] {
-        assert!(content_files_of(&dirs, *victim).await.is_empty());
+        assert_eq!(content_files_of(&dirs, *victim).await, Vec::<String>::new());
     }
     Ok(())
 }
@@ -390,7 +390,7 @@ fn drain_dropped_mid_unit_puts_it_back() -> Result<(), Error> {
         let settled = store.retirement_accounting();
         assert_eq!((settled.queued_units, settled.queued_bytes), (0, 0));
         for victim in &digests[..N / 2 - 1] {
-            assert!(content_files_of(&dirs, *victim).await.is_empty());
+            assert_eq!(content_files_of(&dirs, *victim).await, Vec::<String>::new());
         }
         Ok(())
     })
@@ -454,14 +454,14 @@ async fn drain_passes_a_victim_whose_reader_holds_its_path() -> Result<(), Error
     let passed = store.retirement_accounting();
     assert_eq!(passed.detached_in_flight, 1, "{passed:?}");
     for victim in &digests[1..N / 2 - 1] {
-        assert!(content_files_of(&dirs, *victim).await.is_empty());
+        assert_eq!(content_files_of(&dirs, *victim).await, Vec::<String>::new());
     }
     assert_eq!(content_files_of(&dirs, digests[0]).await.len(), 1);
 
     drop(reader);
     settle(&store).await;
     assert_eq!(store.retirement_accounting().detached_total, 1);
-    assert!(content_files_of(&dirs, digests[0]).await.is_empty());
+    assert_eq!(content_files_of(&dirs, digests[0]).await, Vec::<String>::new());
     drop(held);
     Ok(())
 }
@@ -946,7 +946,7 @@ fn reservation_asleep_before_drain_cancellation_restarts_it() -> Result<(), Erro
         );
         // The batch was retired and the waiting write's blob reads back.
         for victim in &digests[..N / 2 - 1] {
-            assert!(content_files_of(&dirs, *victim).await.is_empty());
+            assert_eq!(content_files_of(&dirs, *victim).await, Vec::<String>::new());
         }
         assert_eq!(
             store.get_part_unchunked(written, 0, None).await?,
