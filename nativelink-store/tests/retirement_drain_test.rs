@@ -1661,3 +1661,257 @@ async fn a_waiter_cancelled_after_selection_is_not_reported() -> Result<(), Erro
     assert_waiting_warnings_coherent!(second_holder);
     Ok(())
 }
+
+// Watcher runtime loss (review t_6a4d226c): the store's watch task runs on the
+// runtime that started it and ends with it. A store opened on a runtime that
+// then shuts down, and used on another, must still report a long admission
+// wait: the waiting retirement restarts the watch task on its own runtime,
+// and the restart is logged. Before, the watch task was started only when the
+// store was opened, and nothing was reported.
+#[nativelink_test]
+async fn a_long_admission_wait_is_reported_after_the_watch_runtime_shut_down() -> Result<(), Error>
+{
+    use nativelink_util::store_trait::StoreKey;
+    const N: usize = 40;
+    const RESTARTED: &str = "Filesystem retirement wait watch task had ended while the store stayed in use; restarted on the current runtime";
+    let _serial = SERIAL.lock().await;
+    let dirs = dirs();
+    // Opened and filled on a runtime of its own, which then shuts down with
+    // the store's watch task.
+    let (content, temp) = (dirs.content.clone(), dirs.temp.clone());
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the store must be opened on a runtime that then shuts down"
+    )]
+    let opener = std::thread::spawn(move || {
+        let runtime = own_runtime();
+        let opened = run_on(&runtime, async move {
+            let dirs = Dirs { content, temp };
+            let store = open_store(&dirs, N * SIZE, N * SIZE / 2).await?;
+            let digests = fill(&store, N - 1).await?;
+            Ok::<_, Error>((store, digests))
+        });
+        drop(runtime);
+        opened
+    });
+    let (store, digests) = tokio::task::spawn_blocking(move || opener.join())
+        .await
+        .expect("join")
+        .expect("the opening thread panicked")?;
+    store.set_retirement_wait_warning_for_test(
+        Duration::from_millis(200),
+        Duration::from_millis(20),
+    );
+
+    // As in the per-waiter test: the first removal's rename holds the
+    // admission until released, and two more removals wait for it.
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+    let release_rx = std::sync::Mutex::new(Some(release_rx));
+    store.set_after_retire_rename_hook_for_test(Some(Arc::new(move || {
+        let entered = entered_tx.lock().unwrap().take();
+        if let Some(tx) = entered {
+            tx.send(()).unwrap();
+            let release = release_rx.lock().unwrap().take();
+            if let Some(rx) = release {
+                rx.recv().unwrap();
+            }
+        }
+    })));
+    let remove = |digest: DigestInfo| {
+        let map = store.get_evicting_map();
+        nativelink_util::background_spawn!("removal", async move {
+            map.remove(&StoreKey::Digest(digest)).await
+        })
+    };
+    let holder = remove(digests[N - 2]);
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(WAIT))
+        .await
+        .expect("join")
+        .expect("the removal's rename reached its hook");
+    let waiters = [remove(digests[N - 3]), remove(digests[N - 4])];
+
+    timeout(WAIT, async {
+        while !logs_contain(WAITING_WARNING) {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("no waiting warning after the watch runtime shut down");
+    assert!(logs_contain(RESTARTED));
+    logs_assert(|lines: &[&str]| {
+        let restarts = lines.iter().filter(|line| line.contains(RESTARTED)).count();
+        if restarts == 1 {
+            Ok(())
+        } else {
+            Err(format!("{restarts} watch restarts, expected one"))
+        }
+    });
+    assert!(
+        !holder.is_finished(),
+        "the holder still holds when reported"
+    );
+
+    release_tx.send(()).unwrap();
+    assert!(
+        timeout(WAIT, holder)
+            .await
+            .expect("holder finished")
+            .expect("join")
+    );
+    for waiter in waiters {
+        assert!(
+            timeout(WAIT, waiter)
+                .await
+                .expect("waiter finished")
+                .expect("join")
+        );
+    }
+    store.set_after_retire_rename_hook_for_test(None);
+    settle(&store).await;
+    let settled = store.retirement_accounting();
+    assert_eq!((settled.queued_units, settled.queued_bytes), (0, 0));
+    Ok(())
+}
+
+// WATCH-R3-01 (review t_d0357215): retirements already waiting on a surviving
+// runtime when the watch task's runtime shuts down must be reported again,
+// with no further retirement started. Here the store is opened on runtime A,
+// whose watch task is the store's; a holder and a waiter then wait on the
+// test's runtime; only then does A shut down. The waiter, woken by the watch
+// task's end, starts another on its own runtime. Before the repair, it had
+// checked the watch task only once, when it started waiting, and nothing was
+// reported until another retirement started.
+#[nativelink_test]
+async fn waiting_retirements_are_reported_after_the_watch_runtime_shuts_down_under_them()
+-> Result<(), Error> {
+    use nativelink_util::store_trait::StoreKey;
+    const N: usize = 40;
+    const RESTARTED: &str = "Filesystem retirement wait watch task had ended while the store stayed in use; restarted on the current runtime";
+    let _serial = SERIAL.lock().await;
+    let dirs = dirs();
+    // Runtime A opens and fills the store, then keeps running (and with it
+    // the store's watch task) until told to shut down.
+    let (content, temp) = (dirs.content.clone(), dirs.temp.clone());
+    let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the store must be opened on a runtime that shuts down later"
+    )]
+    let runtime_a = std::thread::spawn(move || {
+        let runtime = own_runtime();
+        let opened = run_on(&runtime, async move {
+            let dirs = Dirs { content, temp };
+            let store = open_store(&dirs, N * SIZE, N * SIZE / 2).await?;
+            let digests = fill(&store, N - 1).await?;
+            Ok::<_, Error>((store, digests))
+        });
+        opened_tx.send(opened).unwrap();
+        shutdown_rx.recv().unwrap();
+        drop(runtime);
+    });
+    let (store, digests) = tokio::task::spawn_blocking(move || opened_rx.recv())
+        .await
+        .expect("join")
+        .expect("runtime A opened the store")?;
+    // No wait is reported while A's watch task runs: that would use up the
+    // holder's one warning before the test's.
+    store
+        .set_retirement_wait_warning_for_test(Duration::from_secs(3600), Duration::from_millis(20));
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+    let release_rx = std::sync::Mutex::new(Some(release_rx));
+    store.set_after_retire_rename_hook_for_test(Some(Arc::new(move || {
+        let entered = entered_tx.lock().unwrap().take();
+        if let Some(tx) = entered {
+            tx.send(()).unwrap();
+            let release = release_rx.lock().unwrap().take();
+            if let Some(rx) = release {
+                rx.recv().unwrap();
+            }
+        }
+    })));
+    let remove = |digest: DigestInfo| {
+        let map = store.get_evicting_map();
+        nativelink_util::background_spawn!("removal", async move {
+            map.remove(&StoreKey::Digest(digest)).await
+        })
+    };
+    let holder = remove(digests[N - 2]);
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(WAIT))
+        .await
+        .expect("join")
+        .expect("the removal's rename reached its hook");
+    let waiter = remove(digests[N - 3]);
+    eventually("the waiter to wait", || {
+        store.waiting_retirements_for_test() == 1
+    })
+    .await;
+
+    // A shuts down under the waiting retirement; nothing else starts one.
+    shutdown_tx.send(()).unwrap();
+    tokio::task::spawn_blocking(move || runtime_a.join())
+        .await
+        .expect("join")
+        .expect("runtime A's thread panicked");
+    store.set_retirement_wait_warning_for_test(
+        Duration::from_millis(200),
+        Duration::from_millis(20),
+    );
+    timeout(WAIT, async {
+        while !logs_contain(WAITING_WARNING) {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("no waiting warning after the watch runtime shut down under the waiter");
+    logs_assert(|lines: &[&str]| {
+        let restarts = lines.iter().filter(|line| line.contains(RESTARTED)).count();
+        if restarts == 1 {
+            Ok(())
+        } else {
+            Err(format!("{restarts} watch restarts, expected one"))
+        }
+    });
+    assert_eq!(store.waiting_retirements_for_test(), 1);
+    assert!(
+        !holder.is_finished(),
+        "the holder still holds when reported"
+    );
+    assert!(
+        !waiter.is_finished(),
+        "the waiter still waits when reported"
+    );
+    // Several more checks pass: still one warning, for the one holder.
+    sleep(Duration::from_millis(300)).await;
+    let reported_holder = nth_waiting_holder!(1);
+    assert_waiting_warnings_coherent!(reported_holder);
+    logs_assert(|lines: &[&str]| {
+        let warnings = waiting_warnings(lines).len();
+        if warnings == 1 {
+            Ok(())
+        } else {
+            Err(format!("{warnings} waiting warnings for one holder"))
+        }
+    });
+
+    release_tx.send(()).unwrap();
+    for removal in [holder, waiter] {
+        assert!(
+            timeout(WAIT, removal)
+                .await
+                .expect("removal finished")
+                .expect("join")
+        );
+    }
+    assert_eq!(store.waiting_retirements_for_test(), 0);
+    store.set_after_retire_rename_hook_for_test(None);
+    settle(&store).await;
+    let settled = store.retirement_accounting();
+    assert_eq!((settled.queued_units, settled.queued_bytes), (0, 0));
+    Ok(())
+}

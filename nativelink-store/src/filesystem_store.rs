@@ -15,7 +15,7 @@
 use core::cmp;
 use core::fmt::{Debug, Display, Formatter};
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use std::borrow::Cow;
 #[cfg(unix)]
@@ -226,11 +226,28 @@ struct RetirementWaiter {
 /// limit. The release of a reported holder is logged by
 /// [`RetirementAdmission`]. Diagnostic only: nothing here admits, orders or
 /// cancels a retirement.
+///
+/// The watch task runs on the runtime that started it and ends with that
+/// runtime, which can shut down while the store is still in use (a store
+/// shared across runtimes). Each waiting retirement therefore starts the
+/// watch task on its own runtime if none is running (see
+/// [`SharedContext::watch_retirement_waiters`]), both when it starts waiting
+/// and whenever a watch task ends while it waits ([`RetirementWatch`] wakes
+/// it through `watch_ended`, which arms no timer); a restart is logged.
 #[derive(Debug)]
 struct RetirementWaiters {
     waiting: parking_lot::Mutex<HashMap<u64, RetirementWaiter>>,
     warning_ms: AtomicU64,
     check_ms: AtomicU64,
+    /// Whether a watch task is running: set when one is started, cleared when
+    /// its future is dropped (it returns or panics, or its runtime shuts
+    /// down).
+    watching: AtomicBool,
+    /// Watch tasks started for this store, including the first.
+    watch_starts: AtomicU64,
+    /// Notified when a watch task ends, so that waiting retirements start
+    /// another (see [`SharedContext::acquire_retirement_admission`]).
+    watch_ended: tokio::sync::Notify,
     /// Test hook run by [`RetirementWaiters::warn_once_per_holder`] right
     /// after it selects a waiter. See
     /// [`FilesystemStore::set_retirement_wait_selected_hook_for_test`].
@@ -247,6 +264,9 @@ impl Default for RetirementWaiters {
             check_ms: AtomicU64::new(
                 u64::try_from(RETIREMENT_WAIT_CHECK.as_millis()).unwrap_or(u64::MAX),
             ),
+            watching: AtomicBool::new(false),
+            watch_starts: AtomicU64::new(0),
+            watch_ended: tokio::sync::Notify::new(),
             selected: RetireRenameHook::default(),
         }
     }
@@ -335,9 +355,27 @@ impl RetirementWaiters {
     }
 }
 
+/// The store's running watch task, owned by its future: marks it as no
+/// longer running once that future is dropped, whether it returned or
+/// panicked, its runtime shut down, or it was dropped before its first poll,
+/// and wakes the waiting retirements so that one of them starts another.
+struct RetirementWatch(Weak<SharedContext>);
+
+impl Drop for RetirementWatch {
+    fn drop(&mut self) {
+        if let Some(context) = self.0.upgrade() {
+            let waiters = &context.retirement_waiters;
+            waiters.watching.store(false, Ordering::Release);
+            waiters.watch_ended.notify_waiters();
+        }
+    }
+}
+
 /// The store's watch task for [`RetirementWaiters`]. It holds the store's
 /// context weakly and ends once the store is gone (or with its runtime).
-async fn watch_retirement_waiters(context: Weak<SharedContext>) {
+/// Started by [`SharedContext::watch_retirement_waiters`].
+async fn watch_retirement_waiters(watch: RetirementWatch) {
+    let context = watch.0.clone();
     loop {
         let Some(every) = context
             .upgrade()
@@ -450,6 +488,62 @@ impl SharedContext {
         }
     }
 
+    /// Starts the watch task for this store's waiting retirements
+    /// ([`RetirementWaiters`]) on the current runtime, unless one is running.
+    /// A start after the first means an earlier watch task ended while the
+    /// store stayed in use (its runtime shut down, or it panicked); it is
+    /// logged. Outside a Tokio runtime this starts nothing and leaves the
+    /// flag alone, so it never keeps a caller on a runtime from starting one.
+    fn watch_retirement_waiters(self: &Arc<Self>) {
+        let waiters = &self.retirement_waiters;
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        if waiters.watching.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let starts = waiters.watch_starts.fetch_add(1, Ordering::Relaxed) + 1;
+        if starts > 1 {
+            warn!(
+                temp_path = %self.temp_path,
+                watch_starts = starts,
+                "Filesystem retirement wait watch task had ended while the store stayed in use; restarted on the current runtime"
+            );
+        }
+        background_spawn!(
+            "filesystem_store_retirement_watch",
+            watch_retirement_waiters(RetirementWatch(Arc::downgrade(self)))
+        );
+    }
+
+    /// Waits for this store's retirement admission, keeping a watch task
+    /// running for the waiting retirements meanwhile: one is started on this
+    /// runtime now if none is running, and again whenever a running one ends
+    /// while this waits (its runtime shut down while this one survives). The
+    /// wake-up is registered before the check, so an end between the two is
+    /// not missed. The same acquire future is kept throughout, so the waiter
+    /// keeps its place in the admission's queue; dropping this future drops
+    /// it, as before.
+    async fn acquire_retirement_admission(
+        self: &Arc<Self>,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, Error> {
+        let acquire = self.retirement.clone().acquire_owned();
+        tokio::pin!(acquire);
+        loop {
+            let watch_ended = self.retirement_waiters.watch_ended.notified();
+            tokio::pin!(watch_ended);
+            watch_ended.as_mut().enable();
+            self.watch_retirement_waiters();
+            tokio::select! {
+                biased;
+                permit = &mut acquire => {
+                    return permit.map_err(|err| Error::from_std_err(Code::Internal, &err));
+                }
+                () = &mut watch_ended => {}
+            }
+        }
+    }
+
     /// Runs `operation`, a retirement operation of this store, on the
     /// blocking pool once no other one is running: the rename of an evicted
     /// entry's file into the temp directory ([`FileEntryImpl::unref`]) or the
@@ -470,7 +564,7 @@ impl SharedContext {
     /// opens no file, and waiting for one while admitted could hold every
     /// retirement of the store behind the writers whose files it retires.
     async fn retire_blocking<T: Send + 'static>(
-        &self,
+        self: &Arc<Self>,
         kind: RetirementKind,
         operation: impl FnOnce() -> T + Send + 'static,
     ) -> Result<T, Error> {
@@ -490,12 +584,7 @@ impl SharedContext {
                 since: Instant::now(),
             },
         );
-        let permit = self
-            .retirement
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|err| Error::from_std_err(Code::Internal, &err))?;
+        let permit = self.acquire_retirement_admission().await?;
         drop(waiting);
         *self.retirement_holder.lock() = Some(RetirementHolder {
             operation_id,
@@ -3308,10 +3397,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             spec.temp_path.clone(),
             spec.content_path.clone(),
         ));
-        background_spawn!(
-            "filesystem_store_retirement_watch",
-            watch_retirement_waiters(Arc::downgrade(&shared_context))
-        );
+        shared_context.watch_retirement_waiters();
         #[cfg(unix)]
         let executable_locks = Arc::<ExecutableLocks>::default();
 
@@ -3459,15 +3545,11 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         self.shared_context.peak_blocking_retirement_for_test()
     }
 
-    /// Sets how long a retirement drain runs between backlog reports (see
-    /// [`RetirementDrain::run`]), so a test can see a report without waiting
-    /// [`RETIREMENT_REPORT_EVERY`].
-    ///
-    /// # Panics
-    ///
-    /// If `every` is shorter than a millisecond: a drain waiting for a unit
-    /// reports once per interval, and a zero interval would report without
-    /// pause.
+    /// Retirements of this store currently waiting for its admission.
+    pub fn waiting_retirements_for_test(&self) -> usize {
+        self.shared_context.retirement_waiters.waiting.lock().len()
+    }
+
     /// Sets how long a retirement waits for the admission before it is
     /// reported, and how often waits are checked. Takes effect from the watch
     /// task's next check.
@@ -3503,6 +3585,15 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         *self.shared_context.before_retirement_operation.0.lock() = hook;
     }
 
+    /// Sets how long a retirement drain runs between backlog reports (see
+    /// [`RetirementDrain::run`]), so a test can see a report without waiting
+    /// [`RETIREMENT_REPORT_EVERY`].
+    ///
+    /// # Panics
+    ///
+    /// If `every` is shorter than a millisecond: a drain waiting for a unit
+    /// reports once per interval, and a zero interval would report without
+    /// pause.
     pub fn set_retirement_report_interval_for_test(&self, every: Duration) {
         assert!(
             every >= Duration::from_millis(1),
@@ -4806,7 +4897,7 @@ mod write_trace_tests {
     async fn scoped_retirement_reports_admission_while_permit_is_held() {
         use core::task::Poll;
         use futures::poll;
-        let ctx = super::SharedContext::new(String::new(), String::new());
+        let ctx = std::sync::Arc::new(super::SharedContext::new(String::new(), String::new()));
         let permit = ctx.retirement.clone().acquire_owned().await.unwrap();
         let (trace, caller) = trace_in(WritePhase::Retire);
         trace.retirement_stage("callbacks", 3);
@@ -4928,7 +5019,7 @@ mod write_trace_tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let ctx = super::SharedContext::new(String::new(), String::new());
+            let ctx = std::sync::Arc::new(super::SharedContext::new(String::new(), String::new()));
             let (trace, caller) = trace_in(WritePhase::Retire);
             trace.retirement_stage("unrefs", 2);
             let future = super::RETIRE_TRACE.scope(

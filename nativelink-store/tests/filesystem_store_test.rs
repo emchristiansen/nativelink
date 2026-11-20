@@ -5465,3 +5465,207 @@ async fn write_dropped_during_its_duplicate_check_reports_the_checks_end() -> Re
     assert_eq!(store.has(digest).await?, None, "nothing was inserted");
     Ok(())
 }
+
+// PANIC-COV-01 (review t_f5445900): an *unref* unit whose future panics. The
+// drain abandons it and goes on to the units behind it; its bytes are
+// released exactly once, so a write waiting for space under the cap gets it;
+// the rest of its batch and a second, later eviction batch still retire; and
+// its file stays where the panic left it, in the content directory (the panic
+// comes before its rename).
+#[nativelink_test]
+async fn a_panicking_unref_unit_is_released_once_and_the_drain_continues() -> Result<(), Error> {
+    const N: u64 = 40;
+    const SIZE: u64 = 1024;
+    const WAIT: Duration = Duration::from_secs(10);
+    static PANICKED: AtomicBool = AtomicBool::new(false);
+    static PANICKED_PATH: LazyLock<Mutex<Option<OsString>>> = LazyLock::new(|| Mutex::new(None));
+    static PANIC_NOW: tokio::sync::Notify = tokio::sync::Notify::const_new();
+    struct PanicsOnFirstUnref;
+    impl FileEntryHooks for PanicsOnFirstUnref {
+        async fn on_unref_async<Fe: FileEntry>(entry: &Fe) {
+            if PANICKED.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let path = entry
+                .get_file_path_locked(|path| async move { Ok(path) })
+                .await
+                .expect("the entry's path");
+            *PANICKED_PATH.lock() = Some(path);
+            // Suspended until the test lets it panic, in a resumed poll.
+            PANIC_NOW.notified().await;
+            panic!("test unref panics once");
+        }
+    }
+    fn blob(index: u64) -> (DigestInfo, Bytes) {
+        let mut data = format!("panicking-unref-blob-{index}-").into_bytes();
+        data.resize(usize::try_from(SIZE).unwrap(), b'x');
+        let hash: [u8; 32] = Sha256::digest(&data).into();
+        (DigestInfo::new(hash, SIZE), Bytes::from(data))
+    }
+    async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while !condition() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            sleep(Duration::from_millis(5)).await;
+        }
+    }
+    async fn content_files_of(content_path: &str, digest: DigestInfo) -> usize {
+        let prefix = format!("{digest}-");
+        let mut count = 0;
+        let mut entries = tokio::fs::read_dir(format!("{content_path}/{DIGEST_FOLDER_V2}"))
+            .await
+            .expect("content directory");
+        while let Some(entry) = entries.next_entry().await.expect("read content directory") {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    let content_path = make_temp_path("content_path");
+    let store = FilesystemStore::<TestFileEntry<PanicsOnFirstUnref>>::new(&FilesystemSpec {
+        content_path: content_path.clone(),
+        temp_path: make_temp_path("temp_path"),
+        eviction_policy: Some(EvictionPolicy {
+            max_bytes: usize::try_from(N * SIZE).unwrap(),
+            evict_bytes: usize::try_from(N * SIZE / 2).unwrap(),
+            ..Default::default()
+        }),
+        block_size: 1,
+        ..Default::default()
+    })
+    .await?;
+    let mut digests = Vec::new();
+    for index in 0..N - 1 {
+        let (digest, data) = blob(index);
+        store.update_oneshot(digest, data).await?;
+        digests.push(digest);
+    }
+    tokio::time::timeout(WAIT, store.retirement_settled_for_test())
+        .await
+        .expect("filled store settles");
+    assert!(!PANICKED.load(Ordering::SeqCst), "nothing evicted yet");
+
+    // An eviction batch. The drain runs its units one at a time; its first
+    // unref is suspended in the hook, before it asks for the retirement
+    // admission, so the queue stands still with that unit's bytes still
+    // counted. The test then takes the admission, so every unit behind the
+    // panicking one waits for it, and lets the unit panic. The bytes still
+    // queued then are those less the panicked unit's: released once, not
+    // twice, not never.
+    let (digest, data) = blob(N);
+    store.update_oneshot(digest, data).await?;
+    eventually("the first unref to start", || {
+        PANICKED.load(Ordering::SeqCst)
+    })
+    .await;
+    let admission = store.hold_retirement_admission_for_test().await;
+    let queued = store.retirement_accounting();
+    assert!(queued.queued_bytes > 2 * SIZE, "{queued:?}");
+    assert_eq!(queued.panicked_units_total, 0, "{queued:?}");
+    let batch_bytes = queued.queued_bytes;
+    PANIC_NOW.notify_one();
+    eventually("the first unref to panic", || {
+        store.retirement_accounting().panicked_units_total == 1
+    })
+    .await;
+    sleep(Duration::from_millis(100)).await;
+    let after_panic = store.retirement_accounting();
+    assert_eq!(after_panic.panicked_units_total, 1, "{after_panic:?}");
+    assert_eq!(
+        after_panic.queued_bytes,
+        batch_bytes - SIZE,
+        "the panicked unit's bytes are released exactly once: {after_panic:?}"
+    );
+    assert!(after_panic.draining, "{after_panic:?}");
+
+    // A write waiting for space under the cap gets it once the rest runs.
+    store.set_retirement_reservation_cap(Some(SIZE));
+    let waiter = background_spawn!("waiting_write", {
+        let store = store.clone();
+        async move {
+            let (digest, data) = blob(N + 1);
+            store.update_oneshot(digest, data).await.map(|()| digest)
+        }
+    });
+    eventually("the write to wait", || {
+        store.retirement_accounting().waiting_reservations == 1
+    })
+    .await;
+    drop(admission);
+    let written = tokio::time::timeout(WAIT, waiter)
+        .await
+        .expect("the waiting write never got its space")
+        .expect("join")?;
+    store.set_retirement_reservation_cap(None);
+
+    assert_eq!(
+        store.get_part_unchunked(written, 0, None).await?,
+        blob(N + 1).1
+    );
+    tokio::time::timeout(WAIT, store.retirement_settled_for_test())
+        .await
+        .expect("the first batch settles after the panic");
+    let panicked_path = PANICKED_PATH.lock().clone().expect("the panicked path");
+    let panicked_name = Path::new(&panicked_path)
+        .file_name()
+        .expect("a file name")
+        .to_string_lossy()
+        .into_owned();
+    let is_panicked = |digest: &DigestInfo| panicked_name.starts_with(&format!("{digest}-"));
+
+    // The first batch left about half the store resident. Enough later writes
+    // fill it again past `max_bytes`, so a second batch evicts the oldest
+    // residents: every original blob the first batch spared.
+    let mut spared = Vec::new();
+    for digest in &digests {
+        if !is_panicked(digest) && content_files_of(&content_path, *digest).await == 1 {
+            spared.push(*digest);
+        }
+    }
+    assert!(!spared.is_empty(), "the first batch spared some blobs");
+    for index in N + 2..=N + 22 {
+        let (digest, data) = blob(index);
+        store.update_oneshot(digest, data).await?;
+    }
+    tokio::time::timeout(WAIT, store.retirement_settled_for_test())
+        .await
+        .expect("retirement settles after the second batch");
+    for digest in &spared {
+        assert_eq!(
+            content_files_of(&content_path, *digest).await,
+            0,
+            "the second batch retired spared blob {digest}"
+        );
+    }
+    let settled = store.retirement_accounting();
+    assert_eq!(
+        (
+            settled.queued_units,
+            settled.queued_bytes,
+            settled.waiting_reservations,
+            settled.panicked_units_total
+        ),
+        (0, 0, 0, 1),
+        "{settled:?}"
+    );
+
+    // The panicked unit's file is still in the content directory; every
+    // other original blob was retired by one batch or the other.
+    assert!(
+        Path::new(&panicked_path).exists(),
+        "the panicked unit's file stays at {panicked_path:?}"
+    );
+    for digest in &digests {
+        assert_eq!(
+            content_files_of(&content_path, *digest).await,
+            usize::from(is_panicked(digest)),
+            "content files left of original blob {digest}"
+        );
+    }
+    Ok(())
+}
