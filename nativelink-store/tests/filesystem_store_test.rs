@@ -146,6 +146,19 @@ impl<Hooks: FileEntryHooks + 'static + Sync + Send> FileEntry for TestFileEntry<
         self.inner.as_ref().unwrap().get_encoded_file_path()
     }
 
+    async fn try_unref(&self) -> bool {
+        // Like `FileEntryImpl`: give up at once while a reader holds the
+        // path, before running the hooks, so a hooked unref runs once. (A
+        // reader taking the lock between this check and the inner attempt
+        // makes the hooks run again in the detached unref.)
+        if self.get_encoded_file_path().try_write().is_none() {
+            return false;
+        }
+        Hooks::on_unref(self);
+        Hooks::on_unref_async(self).await;
+        self.inner.as_ref().unwrap().try_unref().await
+    }
+
     fn generation(&self) -> Generation {
         self.inner.as_ref().unwrap().generation()
     }
@@ -571,8 +584,8 @@ async fn file_continues_to_stream_on_content_replace_test() -> Result<(), Error>
     // Replace content.
     store.update_oneshot(digest1, VALUE2.into()).await?;
 
-    // Ensure we let any background tasks finish.
-    tokio::task::yield_now().await;
+    // The write queued the replaced entry's retirement; wait for it.
+    store.retirement_settled_for_test().await;
 
     {
         // Now ensure we only have 1 file in our temp path - we know it is a digest.
@@ -672,8 +685,8 @@ async fn file_gets_cleans_up_on_cache_eviction() -> Result<(), Error> {
     // Insert new content. This will evict the old item.
     store.update_oneshot(digest2, VALUE2.into()).await?;
 
-    // Ensure we let any background tasks finish.
-    tokio::task::yield_now().await;
+    // The write queued the evicted entry's retirement; wait for it.
+    store.retirement_settled_for_test().await;
 
     {
         // Now ensure we only have 1 file in our temp path - we know it is a digest.
@@ -803,6 +816,8 @@ async fn eviction_on_insert_calls_unref_once() -> Result<(), Error> {
         .update_oneshot(small_digest.borrow(), SMALL_VALUE.into())
         .await?;
     store.update_oneshot(big_digest, BIG_VALUE.into()).await?;
+    // The write queued the evicted entry's retirement; wait for it.
+    store.retirement_settled_for_test().await;
 
     {
         // Our first digest should have been unrefed exactly once.
@@ -3598,7 +3613,9 @@ async fn concurrent_upload_burst_round_trip_test() -> Result<(), Error> {
 ///
 /// This was mitigated by making file names unique using a generation counter.
 #[nativelink_test]
-async fn diagnostic_caller_drop_during_real_eviction() -> Result<(), Error> {
+async fn eviction_unref_blocked_in_the_drain_does_not_hold_the_writer() -> Result<(), Error> {
+    // Before the retirement drain, the writer retired what its insertion
+    // evicted and waited here; now it only queues that retirement.
     static ENTERED: Semaphore = Semaphore::const_new(0);
     static RELEASE: Semaphore = Semaphore::const_new(0);
     struct Hooks;
@@ -3630,31 +3647,27 @@ async fn diagnostic_caller_drop_during_real_eviction() -> Result<(), Error> {
     store.update_oneshot(digest1, VALUE1.into()).await?;
     let writer = store.clone();
     let task = tokio::spawn(async move { writer.update_oneshot(digest2, other.into()).await });
-    let permit = tokio::time::timeout(Duration::from_secs(5), ENTERED.acquire())
+    tokio::time::timeout(Duration::from_secs(5), ENTERED.acquire())
         .await
         .unwrap()
-        .unwrap();
-    permit.forget();
-    task.abort();
-    assert!(task.await.unwrap_err().is_cancelled());
-    assert!(logs_contain(&format!(
-        "key={digest2} phase=retire detached_stage=true inserted=true"
-    )));
-    assert!(logs_contain("retirement=Some((\"unrefs\", 1,"));
-    RELEASE.add_permits(1);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !logs_contain("Filesystem store write ended after its caller stopped waiting") {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("detached cleanup did not finish");
+        .unwrap()
+        .forget();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the writer waited for the unref of the entry it evicted")
+        .unwrap()?;
     assert_eq!(store.has(digest2).await?, Some(digest2.size_bytes()));
+    assert_eq!(store.has(digest1).await?, None);
+    assert!(store.retirement_accounting().draining);
+    RELEASE.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), store.retirement_settled_for_test())
+        .await
+        .expect("the drain did not finish");
     Ok(())
 }
 
 #[nativelink_test]
-async fn diagnostic_real_eviction_waits_for_entry_path_lock() -> Result<(), Error> {
+async fn eviction_whose_entry_path_is_held_is_detached_from_the_drain() -> Result<(), Error> {
     static ENTERED: Semaphore = Semaphore::const_new(0);
     struct Hooks;
     impl FileEntryHooks for Hooks {
@@ -3681,30 +3694,42 @@ async fn diagnostic_real_eviction_waits_for_entry_path_lock() -> Result<(), Erro
     store.update_oneshot(digest1, VALUE1.into()).await?;
     let entry = store.get_file_entry_for_digest(&digest1).await?;
     let held = entry.get_encoded_file_path().read().await;
-    let writer = store.clone();
-    let task = tokio::spawn(async move { writer.update_oneshot(digest2, other.into()).await });
-    let permit = tokio::time::timeout(Duration::from_secs(5), ENTERED.acquire())
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        store.update_oneshot(digest2, other.into()),
+    )
+    .await
+    .expect("the writer waited for a reader of the entry it evicted")?;
+    // The drain handed the held entry to a detached unref, which entered the
+    // unref and now waits for the reader.
+    tokio::time::timeout(Duration::from_secs(5), ENTERED.acquire())
         .await
         .unwrap()
-        .unwrap();
-    permit.forget();
-    task.abort();
-    assert!(task.await.unwrap_err().is_cancelled());
-    assert!(logs_contain("retirement=Some((\"entry_path_lock\", 1,"));
-    drop(held);
+        .unwrap()
+        .forget();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !logs_contain("Filesystem store write ended after its caller stopped waiting") {
+        loop {
+            let accounting = store.retirement_accounting();
+            if !accounting.draining && accounting.queued_units == 0 {
+                return accounting;
+            }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("detached cleanup did not finish");
+    .map(|accounting| assert_eq!(accounting.detached_in_flight, 1, "{accounting:?}"))
+    .expect("the drain waited behind a reader");
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(5), store.retirement_settled_for_test())
+        .await
+        .expect("the detached unref did not finish");
+    assert_eq!(store.retirement_accounting().detached_total, 1);
     assert_eq!(store.has(digest2).await?, Some(digest2.size_bytes()));
     Ok(())
 }
 
 #[nativelink_test]
-async fn diagnostic_concurrent_same_store_writes_are_distinct() -> Result<(), Error> {
+async fn concurrent_evicting_writes_return_while_their_retirements_wait() -> Result<(), Error> {
     static ENTERED: Semaphore = Semaphore::const_new(0);
     static RELEASE: Semaphore = Semaphore::const_new(0);
     struct Hooks;
@@ -3739,91 +3764,36 @@ async fn diagnostic_concurrent_same_store_writes_are_distinct() -> Result<(), Er
     // Fetching first makes it MRU: touch second to ensure first is evicted first.
     store.get_file_entry_for_digest(&second).await?;
     let held = entry.get_encoded_file_path().read().await;
-    let first_writer = store.clone();
-    let a = tokio::spawn(async move {
-        first_writer
-            .update_oneshot(third, "3".repeat(30).into())
-            .await
-    });
-    tokio::time::timeout(Duration::from_secs(5), ENTERED.acquire())
+    // The first write evicts `first`, whose reader holds its path; the second
+    // evicts `second`, whose unref blocks in the drain. Neither write waits.
+    let writes = futures::future::try_join(
+        {
+            let store = store.clone();
+            async move { store.update_oneshot(third, "3".repeat(30).into()).await }
+        },
+        {
+            let store = store.clone();
+            async move { store.update_oneshot(fourth, "4".repeat(40).into()).await }
+        },
+    );
+    tokio::time::timeout(Duration::from_secs(5), writes)
         .await
-        .unwrap()
-        .unwrap()
-        .forget();
-    let second_writer = store.clone();
-    let b = tokio::spawn(async move {
-        second_writer
-            .update_oneshot(fourth, "4".repeat(40).into())
+        .expect("an evicting write waited for its retirement")?;
+    for _ in 0..2 {
+        tokio::time::timeout(Duration::from_secs(5), ENTERED.acquire())
             .await
-    });
-    tokio::time::timeout(Duration::from_secs(5), ENTERED.acquire())
-        .await
-        .unwrap()
-        .unwrap()
-        .forget();
-    a.abort();
-    b.abort();
-    assert!(a.await.unwrap_err().is_cancelled());
-    assert!(b.await.unwrap_err().is_cancelled());
-    assert!(logs_contain(&format!(
-        "key={third} phase=retire detached_stage=true inserted=true"
-    )));
-    assert!(logs_contain(&format!(
-        "key={fourth} phase=retire detached_stage=true inserted=true"
-    )));
-    assert!(logs_contain("retirement=Some((\"entry_path_lock\", 1,"));
-    assert!(logs_contain("retirement=Some((\"unrefs\", 1,"));
-    drop(held);
-    RELEASE.add_permits(1);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if logs_contain(&format!(
-                "Filesystem store write ended after its caller stopped waiting key={third}"
-            )) && logs_contain(&format!(
-                "Filesystem store write ended after its caller stopped waiting key={fourth}"
-            )) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("both detached writes must finish");
-    logs_assert(|lines| {
-        let mut ids = Vec::new();
-        for (key, stage) in [(third, "entry_path_lock"), (fourth, "unrefs")] {
-            let key_field = format!("key={key}");
-            let drop_line = lines
-                .iter()
-                .find(|line| {
-                    line.contains("Caller stopped waiting for a filesystem store write")
-                        && line.contains(&key_field)
-                        && line.contains(&format!("retirement=Some((\"{stage}\", 1,"))
-                })
-                .ok_or_else(|| format!("missing {stage} drop for {key}"))?;
-            let id = drop_line
-                .split("write_id=")
-                .nth(1)
-                .and_then(|rest| rest.split_whitespace().next())
-                .ok_or_else(|| format!("missing write_id for {key}"))?;
-            if !lines.iter().any(|line| {
-                line.contains("Filesystem store write ended after its caller stopped waiting")
-                    && line.contains(&key_field)
-                    && line.contains(&format!("write_id={id} "))
-            }) {
-                return Err(format!(
-                    "missing matching completion for {key} write_id={id}"
-                ));
-            }
-            ids.push(id);
-        }
-        if ids[0] == ids[1] {
-            return Err("concurrent writes shared an ID".into());
-        }
-        Ok(())
-    });
+            .unwrap()
+            .unwrap()
+            .forget();
+    }
     assert_eq!(store.has(third).await?, Some(30));
     assert_eq!(store.has(fourth).await?, Some(40));
+    drop(held);
+    RELEASE.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), store.retirement_settled_for_test())
+        .await
+        .expect("retirement did not finish");
+    drop(entry);
     Ok(())
 }
 
@@ -4864,6 +4834,8 @@ async fn eviction_unrefs_entries_one_at_a_time() -> Result<(), Error> {
     store
         .update_oneshot(big_digest, Bytes::from(vec![b'y'; 40]))
         .await?;
+    // The write queued the evictions; the drain runs them, one at a time.
+    store.retirement_settled_for_test().await;
 
     assert_eq!(UNREFS_FINISHED.load(Ordering::SeqCst), EVICTED_ENTRIES);
     assert_eq!(
@@ -5274,7 +5246,7 @@ async fn write_dropped_during_publication_reports_its_detached_end() -> Result<(
 /// reports its end once retirement is admitted.
 #[cfg(target_family = "unix")]
 #[nativelink_test]
-async fn write_dropped_during_retirement_is_reported_as_inserted() -> Result<(), Error> {
+async fn displacing_write_returns_while_retirement_is_held() -> Result<(), Error> {
     let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
         content_path: make_temp_path("content_path"),
         temp_path: make_temp_path("temp_path"),
@@ -5291,43 +5263,26 @@ async fn write_dropped_during_retirement_is_reported_as_inserted() -> Result<(),
     assert_eq!(count_log_lines(logs, &retiring), 1);
 
     // Different content of the same size is no duplicate, so its publication
-    // displaces the first generation, whose retirement then waits here.
+    // displaces the first generation. Its retirement is only queued: the
+    // write returns although every retirement of the store is held.
     let admission = store.hold_retirement_admission_for_test().await;
-    let writer = background_spawn!("displacing_write", {
-        let store = store.clone();
-        async move { store.update_oneshot(digest, VALUE2.into()).await }
-    });
-    wait_for_log_lines(logs, &retiring, 2).await?;
-    writer.abort();
-    assert!(writer.await.is_err_and(|err| err.is_cancelled()));
-    assert_eq!(
-        count_log_lines(
-            logs,
-            &format!(
-                "Caller stopped waiting for a filesystem store write key={key} \
-                 phase=retire detached_stage=true inserted=true"
-            )
-        ),
-        1
-    );
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        store.update_oneshot(digest, VALUE2.into()),
+    )
+    .await
+    .expect("the displacing write waited for the retirement admission")?;
+    assert_eq!(count_log_lines(logs, &retiring), 2);
     assert_eq!(
         store.get_part_unchunked(digest, 0, None).await?,
         VALUE2.as_bytes(),
-        "the dropped write had already inserted its file"
     );
-
-    let ended = format!("Filesystem store write ended after its caller stopped waiting key={key}");
-    assert_eq!(count_log_lines(logs, &ended), 0, "retirement is still held");
+    assert!(store.retirement_accounting().queued_bytes > 0);
     drop(admission);
-    wait_for_log_lines(logs, &ended, 1).await?;
-    logs_assert(|lines: &[&str]| {
-        let line = lines.iter().find(|line| line.contains(&ended)).unwrap();
-        if line.contains("inserted=true outcome=inserted") {
-            Ok(())
-        } else {
-            Err(format!("unexpected end: {line}"))
-        }
-    });
+    tokio::time::timeout(Duration::from_secs(5), store.retirement_settled_for_test())
+        .await
+        .expect("retirement did not finish");
+    assert_eq!(store.retirement_accounting().queued_bytes, 0);
     Ok(())
 }
 

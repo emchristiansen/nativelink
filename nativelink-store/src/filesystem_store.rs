@@ -40,7 +40,9 @@ use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair,
 };
 use nativelink_util::common::{DigestInfo, fs};
-use nativelink_util::evicting_map::{EvictingMap, EvictionSnapshot, InsertCleanup, LenEntry};
+use nativelink_util::evicting_map::{
+    EvictingMap, EvictionSnapshot, InsertCleanup, LenEntry, RemoveFuture,
+};
 use nativelink_util::fs::FileSlot;
 use nativelink_util::health_utils::{HealthRegistryBuilder, HealthStatus, HealthStatusIndicator};
 use nativelink_util::spawn_blocking;
@@ -119,6 +121,23 @@ pub struct SharedContext {
     /// Admits one retirement operation of this store at a time. See
     /// [`SharedContext::retire_blocking`].
     retirement: Arc<Semaphore>,
+    /// Test hook run on the blocking pool right after a retirement rename
+    /// has succeeded and before its new path is recorded. See
+    /// [`FilesystemStore::set_after_retire_rename_hook_for_test`].
+    after_retire_rename: RetireRenameHook,
+}
+
+type RetireRenameHookFn = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Default)]
+struct RetireRenameHook(parking_lot::Mutex<Option<RetireRenameHookFn>>);
+
+impl Debug for RetireRenameHook {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("RetireRenameHook")
+            .field(&self.0.lock().is_some())
+            .finish()
+    }
 }
 
 /// The files of retired entries that are waiting to be deleted, and whether a
@@ -137,6 +156,14 @@ impl SharedContext {
             content_path,
             retired_files: parking_lot::Mutex::default(),
             retirement: Arc::new(Semaphore::new(1)),
+            after_retire_rename: RetireRenameHook::default(),
+        }
+    }
+
+    fn after_retire_rename(&self) {
+        let hook = self.after_retire_rename.0.lock().clone();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
@@ -287,6 +314,430 @@ impl Drop for RetiredFileDrain {
         if !self.finished {
             self.shared_context.retired_files.lock().draining = false;
         }
+    }
+}
+
+/// One piece of the cleanup owed to entries that left a store's map.
+enum RetirementUnit<Fe> {
+    /// A remove callback of an entry (for the CAS, deleting its executable
+    /// variant). It runs as returned by the map.
+    Callback(RemoveFuture),
+    /// An entry to `unref()`: its file is renamed into the temp directory and
+    /// deleted once the last reader drops it.
+    Unref(Arc<Fe>),
+}
+
+struct RetirementState<Fe> {
+    units: VecDeque<RetirementUnit<Fe>>,
+    /// Whether a [`RetirementDrain`] is running.
+    draining: bool,
+    /// Bytes (as the map counts them) of the `Unref` units queued or in
+    /// progress. Released when the unit's rename has finished or the unit has
+    /// been handed to a detached task (see [`RetirementDrain::run`]).
+    queued_bytes: u64,
+    /// Bytes reserved by writes that have not yet published or failed.
+    reserved_bytes: u64,
+    /// Largest `queued_bytes + reserved_bytes` seen right after a change.
+    peak_bytes: u64,
+    /// `None` (the default): reservations are only counted, never waited
+    /// for. `Some(cap)`: see [`RetirementQueue::reserve`].
+    cap: Option<u64>,
+    /// Unrefs handed to detached tasks that have not finished.
+    detached_in_flight: u64,
+    detached_total: u64,
+    /// Detached unrefs whose task has been polled at least once.
+    detached_started_total: u64,
+    /// Detached unrefs dropped unfinished and put back on the queue.
+    requeued_detached_total: u64,
+    /// Reservations currently asleep waiting for space.
+    waiting_reservations: u64,
+}
+
+/// Counts one reservation asleep in [`RetirementQueue::reserve`] until it
+/// wakes or is cancelled.
+struct WaitingReservation<'a, Fe>(&'a parking_lot::Mutex<RetirementState<Fe>>);
+
+impl<Fe> Drop for WaitingReservation<'_, Fe> {
+    fn drop(&mut self) {
+        self.0.lock().waiting_reservations -= 1;
+    }
+}
+
+impl<Fe> RetirementState<Fe> {
+    fn note_peak(&mut self) {
+        self.peak_bytes = self
+            .peak_bytes
+            .max(self.queued_bytes.saturating_add(self.reserved_bytes));
+    }
+
+    fn settled(&self) -> bool {
+        self.units.is_empty() && !self.draining && self.detached_in_flight == 0
+    }
+}
+
+/// The retirement of entries that left a filesystem store's map, kept off the
+/// paths that evicted them.
+///
+/// An insertion that crosses `max_bytes` evicts down to `max_bytes -
+/// evict_bytes`, and the release of an action's input leases can evict an
+/// even larger batch (a leased entry cannot be evicted, so the map can be
+/// over its limit when the leases end). Each evicted entry's file has to be
+/// renamed into the temp directory, one rename at a time (see
+/// [`SharedContext::retire_blocking`]). Run by the writer, or by the action
+/// teardown that released the leases, that batch held the writer or the
+/// teardown for all of it, and every concurrent writer that queued behind it
+/// for the retirement admission. Here the cleanup is queued instead, and one
+/// drain task per store runs it, in order: each cleanup's remove callbacks,
+/// then its unrefs, as [`InsertCleanup`] runs them.
+///
+/// Contracts:
+/// - Enqueueing cannot fail and does not wait. An entry is out of the map
+///   before its cleanup is queued, so lookups miss it as before.
+/// - The drain never waits for an entry's path lock: if a reader holds it,
+///   the drain hands that entry's `unref()` to a detached task and moves on.
+///   It waits only for the retirement admission, whose holders are running
+///   renames and unlinks, and for an executable-variant lease, whose holders
+///   are running variant copies. Neither waits for the drain or for a
+///   reservation, so no cycle runs through the drain.
+/// - A drain dropped unfinished (its task was cancelled, e.g. at runtime
+///   shutdown) puts the unit it was running back at the head of the queue, so
+///   no unit is silently lost; the next enqueue starts a new drain. Units
+///   still queued when the store is dropped are never run: their files stay
+///   at their content paths and are indexed again at the next startup, and
+///   files already renamed into the temp directory are deleted by the startup
+///   prune of that directory.
+pub struct RetirementQueue<Fe> {
+    state: parking_lot::Mutex<RetirementState<Fe>>,
+    /// Woken whenever `queued_bytes` or `reserved_bytes` decreases.
+    space_freed: tokio::sync::Notify,
+    /// Woken whenever the queue may have become settled.
+    settled: tokio::sync::Notify,
+}
+
+impl<Fe> Debug for RetirementQueue<Fe> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        let state = self.state.lock();
+        f.debug_struct("RetirementQueue")
+            .field("units", &state.units.len())
+            .field("draining", &state.draining)
+            .field("queued_bytes", &state.queued_bytes)
+            .field("reserved_bytes", &state.reserved_bytes)
+            .field("cap", &state.cap)
+            .field("detached_in_flight", &state.detached_in_flight)
+            .finish()
+    }
+}
+
+/// A snapshot of a store's retirement accounting, for tests and diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetirementAccounting {
+    pub queued_units: usize,
+    pub queued_bytes: u64,
+    pub reserved_bytes: u64,
+    pub peak_bytes: u64,
+    pub draining: bool,
+    pub detached_in_flight: u64,
+    pub detached_total: u64,
+    pub detached_started_total: u64,
+    pub requeued_detached_total: u64,
+    pub waiting_reservations: u64,
+}
+
+impl<Fe: FileEntry> RetirementQueue<Fe> {
+    fn new() -> Self {
+        Self {
+            state: parking_lot::Mutex::new(RetirementState {
+                units: VecDeque::new(),
+                draining: false,
+                queued_bytes: 0,
+                reserved_bytes: 0,
+                peak_bytes: 0,
+                cap: None,
+                detached_in_flight: 0,
+                detached_total: 0,
+                detached_started_total: 0,
+                requeued_detached_total: 0,
+                waiting_reservations: 0,
+            }),
+            space_freed: tokio::sync::Notify::new(),
+            settled: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Queues `callbacks`, then the unrefs of `entries`, and starts a drain if
+    /// none is running and anything is queued, including units an earlier
+    /// drain left when it was dropped.
+    fn enqueue(self: &Arc<Self>, callbacks: Vec<RemoveFuture>, entries: Vec<Arc<Fe>>) {
+        let mut state = self.state.lock();
+        state
+            .units
+            .extend(callbacks.into_iter().map(RetirementUnit::Callback));
+        for entry in entries {
+            state.queued_bytes = state.queued_bytes.saturating_add(entry.len());
+            state.units.push_back(RetirementUnit::Unref(entry));
+        }
+        state.note_peak();
+        if state.draining || state.units.is_empty() {
+            // The running drain takes these units before it can find the
+            // queue empty: both happen under this lock.
+            return;
+        }
+        state.draining = true;
+        drop(state);
+        self.spawn_drain();
+    }
+
+    /// Starts a drain. The caller has just set `draining` under the lock.
+    fn spawn_drain(self: &Arc<Self>) {
+        let drain = RetirementDrain {
+            queue: self.clone(),
+            current: None,
+            finished: false,
+        };
+        background_spawn!("filesystem_store_retirement_drain", drain.run());
+    }
+
+    fn enqueue_cleanup(self: &Arc<Self>, cleanup: InsertCleanup<Arc<Fe>>) {
+        let (callbacks, entries) = cleanup.into_parts();
+        self.enqueue(callbacks, entries);
+    }
+
+    fn release_queued(&self, bytes: u64) {
+        let mut state = self.state.lock();
+        state.queued_bytes = state.queued_bytes.saturating_sub(bytes);
+        drop(state);
+        self.space_freed.notify_waiters();
+    }
+
+    /// Reserves `bytes` for a write about to create its temp file. The caller
+    /// must hold no open-file permit, write permit, entry of this store or
+    /// executable-variant lease while it waits here.
+    ///
+    /// Without a cap this never waits. With `Some(cap)`, it waits until the
+    /// reservation fits: `queued + reserved + bytes <= cap`, or nothing is
+    /// queued or reserved (so a write larger than `cap` waits for an empty
+    /// queue instead of forever). The check and the reservation happen under
+    /// one lock, so simultaneous writes cannot all pass the same check.
+    async fn reserve(self: &Arc<Self>, bytes: u64) -> SpaceReservation<Fe> {
+        loop {
+            let notified = self.space_freed.notified();
+            tokio::pin!(notified);
+            // Registered before the check, so a release between the check
+            // and the wait still wakes this waiter.
+            notified.as_mut().enable();
+            {
+                let mut state = self.state.lock();
+                let used = state.queued_bytes.saturating_add(state.reserved_bytes);
+                let fits = match state.cap {
+                    None => true,
+                    Some(cap) => used == 0 || used.saturating_add(bytes) <= cap,
+                };
+                if fits {
+                    state.reserved_bytes = state.reserved_bytes.saturating_add(bytes);
+                    state.note_peak();
+                    return SpaceReservation {
+                        queue: self.clone(),
+                        bytes,
+                    };
+                }
+                // The queued bytes this write waits for may belong to units
+                // an earlier drain left when it was dropped. No write that
+                // waits here can enqueue and restart one, so start it here.
+                let restart = !state.draining && !state.units.is_empty();
+                if restart {
+                    state.draining = true;
+                }
+                state.waiting_reservations += 1;
+                drop(state);
+                if restart {
+                    self.spawn_drain();
+                }
+            }
+            let waiting = WaitingReservation(&self.state);
+            notified.await;
+            drop(waiting);
+        }
+    }
+
+    fn accounting(&self) -> RetirementAccounting {
+        let state = self.state.lock();
+        RetirementAccounting {
+            queued_units: state.units.len(),
+            queued_bytes: state.queued_bytes,
+            reserved_bytes: state.reserved_bytes,
+            peak_bytes: state.peak_bytes,
+            draining: state.draining,
+            detached_in_flight: state.detached_in_flight,
+            detached_total: state.detached_total,
+            detached_started_total: state.detached_started_total,
+            requeued_detached_total: state.requeued_detached_total,
+            waiting_reservations: state.waiting_reservations,
+        }
+    }
+
+    async fn wait_settled(&self) {
+        loop {
+            let notified = self.settled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.state.lock().settled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Hands `entry`'s `unref()` to a detached task, which waits for the
+    /// reader holding its path lock. Its queued bytes are released by the
+    /// caller: from here on the file is held by a reader, as any file a reader
+    /// holds.
+    ///
+    /// The obligation is owned by a [`DetachedUnref`] created here, before
+    /// the task is spawned, and moved into it. Dropped unfinished — before its
+    /// first poll or while waiting, e.g. because its runtime shut down — it
+    /// puts the entry back on the queue with its bytes, so neither the count
+    /// nor the unref is lost; the next enqueue starts a drain to run it.
+    fn detach_unref(self: &Arc<Self>, entry: Arc<Fe>) {
+        {
+            let mut state = self.state.lock();
+            state.detached_in_flight += 1;
+            state.detached_total += 1;
+        }
+        let detached = DetachedUnref {
+            queue: self.clone(),
+            bytes: entry.len(),
+            entry: Some(entry),
+        };
+        background_spawn!("filesystem_store_detached_unref", detached.run());
+    }
+}
+
+/// A detached `unref()` that is owed until it has finished. See
+/// [`RetirementQueue::detach_unref`].
+struct DetachedUnref<Fe> {
+    queue: Arc<RetirementQueue<Fe>>,
+    /// The entry's size as the map counts it.
+    bytes: u64,
+    /// Taken once the unref has finished.
+    entry: Option<Arc<Fe>>,
+}
+
+impl<Fe: FileEntry> DetachedUnref<Fe> {
+    async fn run(mut self) {
+        self.queue.state.lock().detached_started_total += 1;
+        if let Some(entry) = self.entry.as_ref() {
+            entry.unref().await;
+        }
+        self.entry = None;
+    }
+}
+
+impl<Fe> Drop for DetachedUnref<Fe> {
+    fn drop(&mut self) {
+        let mut state = self.queue.state.lock();
+        state.detached_in_flight -= 1;
+        if let Some(entry) = self.entry.take() {
+            // Unfinished: the unref is owed again. `unref()` is safe to run
+            // again: it either renamed and recorded the new path, or did
+            // neither (see `unref_locked`).
+            state.queued_bytes = state.queued_bytes.saturating_add(self.bytes);
+            state.units.push_back(RetirementUnit::Unref(entry));
+            state.requeued_detached_total += 1;
+            state.note_peak();
+        }
+        drop(state);
+        self.queue.settled.notify_waiters();
+        // A requeued unref is owed by no running drain until one starts; wake
+        // waiting reservations so one can start it.
+        self.queue.space_freed.notify_waiters();
+    }
+}
+
+/// Bytes a write has reserved with [`RetirementQueue::reserve`]; released when
+/// dropped, once the write has published its file (the map counts it from
+/// then on) or has failed.
+#[must_use]
+pub struct SpaceReservation<Fe> {
+    queue: Arc<RetirementQueue<Fe>>,
+    bytes: u64,
+}
+
+impl<Fe> Debug for SpaceReservation<Fe> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SpaceReservation")
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+impl<Fe> Drop for SpaceReservation<Fe> {
+    fn drop(&mut self) {
+        let mut state = self.queue.state.lock();
+        state.reserved_bytes = state.reserved_bytes.saturating_sub(self.bytes);
+        drop(state);
+        self.queue.space_freed.notify_waiters();
+    }
+}
+
+/// The one task allowed to run a store's queued retirement, while it exists.
+struct RetirementDrain<Fe> {
+    queue: Arc<RetirementQueue<Fe>>,
+    /// The unit being run. Taken off the queue, but put back at its head if
+    /// the drain is dropped before the unit has finished.
+    current: Option<RetirementUnit<Fe>>,
+    finished: bool,
+}
+
+impl<Fe: FileEntry> RetirementDrain<Fe> {
+    async fn run(mut self) {
+        loop {
+            {
+                let mut state = self.queue.state.lock();
+                let Some(unit) = state.units.pop_front() else {
+                    state.draining = false;
+                    self.finished = true;
+                    drop(state);
+                    self.queue.settled.notify_waiters();
+                    return;
+                };
+                self.current = Some(unit);
+            }
+            let completed_unref = match self.current.as_mut() {
+                Some(RetirementUnit::Callback(callback)) => {
+                    callback.as_mut().await;
+                    None
+                }
+                Some(RetirementUnit::Unref(entry)) => Some(entry.try_unref().await),
+                None => unreachable!("a unit was just taken"),
+            };
+            let unit = self.current.take();
+            if let (Some(RetirementUnit::Unref(entry)), Some(unrefed)) = (unit, completed_unref) {
+                let bytes = entry.len();
+                if !unrefed {
+                    self.queue.detach_unref(entry);
+                }
+                self.queue.release_queued(bytes);
+            }
+        }
+    }
+}
+
+impl<Fe> Drop for RetirementDrain<Fe> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut state = self.queue.state.lock();
+        if let Some(unit) = self.current.take() {
+            state.units.push_front(unit);
+        }
+        state.draining = false;
+        drop(state);
+        // A reservation may be asleep waiting for this drain to free space,
+        // and with it gone none will be freed: wake it to recheck, find the
+        // queue idle with units left and start a drain itself (see
+        // `RetirementQueue::reserve`).
+        self.queue.space_freed.notify_waiters();
     }
 }
 
@@ -450,6 +901,18 @@ pub trait FileEntry: LenEntry + Send + Sync + Debug + 'static {
     /// Gets the underlying `EncodedfilePath`.
     fn get_encoded_file_path(&self) -> &RwLock<EncodedFilePath>;
 
+    /// Like [`LenEntry::unref`], but returns `false` at once, having done
+    /// nothing, if it would first have to wait for the entry's path lock (a
+    /// reader is using the file). The retirement drain uses it so that it
+    /// never waits behind a reader; see [`RetirementQueue`]. The default waits
+    /// like `unref()`, for entry types without a path lock.
+    fn try_unref(&self) -> impl Future<Output = bool> + Send {
+        async move {
+            self.unref().await;
+            true
+        }
+    }
+
     /// Returns a reader that will read part of the underlying file.
     fn read_file_part(
         &self,
@@ -476,14 +939,19 @@ pub trait FileEntry: LenEntry + Send + Sync + Debug + 'static {
 pub struct FileEntryImpl {
     data_size: u64,
     block_size: u64,
-    // We lock around this as it gets rewritten when we move between temp and content types
-    encoded_file_path: RwLock<EncodedFilePath>,
+    // We lock around this as it gets rewritten when we move between temp and content types.
+    // Shared so that a retirement rename can own the write guard until it has
+    // recorded the file's new path (see `unref_locked`).
+    encoded_file_path: Arc<RwLock<EncodedFilePath>>,
     generation: Generation,
 }
 
 impl FileEntryImpl {
     pub fn get_shared_context_for_test(&mut self) -> Arc<SharedContext> {
-        self.encoded_file_path.get_mut().shared_context.clone()
+        self.encoded_file_path
+            .read_blocking()
+            .shared_context
+            .clone()
     }
 }
 
@@ -497,7 +965,7 @@ impl FileEntry for FileEntryImpl {
         Self {
             data_size,
             block_size,
-            encoded_file_path,
+            encoded_file_path: Arc::new(encoded_file_path),
             generation,
         }
     }
@@ -562,6 +1030,14 @@ impl FileEntry for FileEntryImpl {
 
     fn get_encoded_file_path(&self) -> &RwLock<EncodedFilePath> {
         &self.encoded_file_path
+    }
+
+    async fn try_unref(&self) -> bool {
+        let Some(encoded_file_path) = self.encoded_file_path.try_write_arc() else {
+            return false;
+        };
+        unref_locked(encoded_file_path).await;
+        true
     }
 
     fn read_file_part(
@@ -909,53 +1385,89 @@ impl LenEntry for FileEntryImpl {
     #[inline]
     async fn unref(&self) {
         retirement_detail("entry_path_lock");
-        let mut encoded_file_path = self.encoded_file_path.write().await;
-        if encoded_file_path.path_type == PathType::Temp {
-            // We are already a temp file that is now marked for deletion on drop.
-            // This is very rare, but most likely the rename into the content path failed.
-            warn!(
-                key = ?encoded_file_path.key,
-                "File is already a temp file",
-            );
-            return;
-        }
-        let from_path = encoded_file_path.get_file_path();
-        let new_key = make_temp_key(&encoded_file_path.key);
+        let encoded_file_path = self.encoded_file_path.write_arc().await;
+        unref_locked(encoded_file_path).await;
+    }
+}
 
-        let to_path = to_full_path_from_key(
-            &encoded_file_path.shared_context.temp_path,
-            &new_key,
-            encoded_file_path.generation,
-            // Legacy files may survive a failed migration, but only the new
-            // temporary directories are guaranteed to exist on this startup.
-            Version::V2,
+/// The body of [`FileEntryImpl::unref`], once its path lock is held.
+///
+/// The rename and the change of the entry's path to the file's new name are
+/// one operation: the owned path guard moves into the admitted blocking
+/// closure, which renames the file and records where it went before it
+/// releases the guard. Cancelling this future therefore cannot separate them.
+/// Dropped before the closure starts (while waiting for the admission), the
+/// closure is dropped unrun with the guard: nothing was renamed and the entry
+/// still names its content file, so a later `unref()` starts over. Once the
+/// closure runs, it finishes, renamed or not, and the entry names wherever the
+/// file is; a later `unref()` finds it already `Temp`. Readers wait for the
+/// guard, so no reader resolves the path between the rename and its record.
+async fn unref_locked(encoded_file_path: async_lock::RwLockWriteGuardArc<EncodedFilePath>) {
+    if encoded_file_path.path_type == PathType::Temp {
+        // Already retired: renamed by an earlier unref, possibly one whose
+        // caller was cancelled after the rename, or the rename into the
+        // content path failed.
+        debug!(
+            key = ?encoded_file_path.key,
+            "File is already a temp file",
         );
+        return;
+    }
+    let shared_context = encoded_file_path.shared_context.clone();
+    let renamed = shared_context
+        .retire_blocking(RetirementKind::Rename, move || {
+            rename_and_record(encoded_file_path);
+        })
+        .await;
+    retirement_detail("entry_after_rename");
+    if let Err(err) = renamed {
+        // The blocking task could not be joined (e.g. runtime shutdown) or
+        // the admission is closed. Whatever the closure did, it recorded.
+        warn!(?err, "Retirement rename task did not report");
+    }
+}
 
-        let renamed = encoded_file_path
-            .shared_context
-            .retire_blocking(RetirementKind::Rename, {
-                let (from_path, to_path) = (from_path.to_os_string(), to_path.clone());
-                move || {
-                    std::fs::rename(&from_path, &to_path).map_err(|err| {
-                        // ENOENT from rename is ambiguous: the source may be
-                        // gone, or a directory component of the destination
-                        // (the temp dir) may be missing. Confirm the source is
-                        // genuinely gone before treating it as benign —
-                        // otherwise a removed temp dir would flip an intact
-                        // content file to Temp and orphan it on disk.
-                        let source_gone = err.kind() == std::io::ErrorKind::NotFound
-                            && matches!(
-                                std::fs::metadata(&from_path),
-                                Err(meta_err) if meta_err.kind() == std::io::ErrorKind::NotFound
-                            );
-                        (Error::from(err), source_gone)
-                    })
-                }
-            })
-            .await
-            .unwrap_or_else(|err| Err((err, false)));
-        retirement_detail("entry_after_rename");
-        if let Err((err, source_gone)) = renamed {
+/// Renames the entry's content file into the temp directory and records the
+/// outcome in the entry, under the entry's path write guard. Runs on the
+/// blocking pool under the store's retirement admission.
+fn rename_and_record(mut encoded_file_path: async_lock::RwLockWriteGuardArc<EncodedFilePath>) {
+    let from_path = encoded_file_path.get_file_path().into_owned();
+    let new_key = make_temp_key(&encoded_file_path.key);
+    let to_path = to_full_path_from_key(
+        &encoded_file_path.shared_context.temp_path,
+        &new_key,
+        encoded_file_path.generation,
+        // Legacy files may survive a failed migration, but only the new
+        // temporary directories are guaranteed to exist on this startup.
+        Version::V2,
+    );
+    let renamed = std::fs::rename(&from_path, &to_path);
+    if renamed.is_ok() {
+        encoded_file_path.shared_context.after_retire_rename();
+    }
+    match renamed {
+        Ok(()) => {
+            debug!(
+                key = ?encoded_file_path.key,
+                ?from_path,
+                ?to_path,
+                "Renamed file (unref)",
+            );
+            encoded_file_path.path_type = PathType::Temp;
+            encoded_file_path.key = new_key;
+            encoded_file_path.version = Version::V2;
+        }
+        Err(err) => {
+            // ENOENT from rename is ambiguous: the source may be gone, or a
+            // directory component of the destination (the temp dir) may be
+            // missing. Confirm the source is genuinely gone before treating
+            // it as benign — otherwise a removed temp dir would flip an
+            // intact content file to Temp and orphan it on disk.
+            let source_gone = err.kind() == std::io::ErrorKind::NotFound
+                && matches!(
+                    std::fs::metadata(&from_path),
+                    Err(meta_err) if meta_err.kind() == std::io::ErrorKind::NotFound
+                );
             if source_gone {
                 // The file is already gone — typically another thread's
                 // eviction beat us, or the entry never got its file on
@@ -983,16 +1495,6 @@ impl LenEntry for FileEntryImpl {
                     "Failed to rename file",
                 );
             }
-        } else {
-            debug!(
-                key = ?encoded_file_path.key,
-                ?from_path,
-                ?to_path,
-                "Renamed file (unref)",
-            );
-            encoded_file_path.path_type = PathType::Temp;
-            encoded_file_path.key = new_key;
-            encoded_file_path.version = Version::V2;
         }
     }
 }
@@ -1827,28 +2329,20 @@ enum AfterPublication<Fe> {
 }
 
 impl<Fe: FileEntry> AfterPublication<Fe> {
-    /// Retires the displaced or superseded files. This waits for the store's
-    /// retirement admission (`unref()` renames them into the temp directory;
-    /// see [`SharedContext::retire_blocking`]), never for an open-file permit.
-    async fn run(self) {
+    /// Queues the retirement of the displaced or superseded files on the
+    /// store's [`RetirementQueue`] and returns the number of units queued,
+    /// without waiting for any of them.
+    fn defer(self, retirement: &Arc<RetirementQueue<Fe>>) -> usize {
         match self {
-            Self::Inserted(cleanup) => drop(cleanup.run().await),
-            Self::Superseded(entry) => entry.unref().await,
-        }
-    }
-
-    async fn run_traced(self, trace: &WriteTrace) {
-        match self {
-            Self::Inserted(cleanup) => drop(
-                cleanup
-                    .run_observed(|stage, count| {
-                        trace.retirement_stage(stage, count);
-                    })
-                    .await,
-            ),
+            Self::Inserted(cleanup) => {
+                let (callbacks, entries) = cleanup.into_parts();
+                let units = callbacks.len() + entries.len();
+                retirement.enqueue(callbacks, entries);
+                units
+            }
             Self::Superseded(entry) => {
-                trace.retirement_stage("superseded_unref", 1);
-                entry.unref().await;
+                retirement.enqueue(Vec::new(), vec![entry]);
+                1
             }
         }
     }
@@ -2058,6 +2552,9 @@ pub struct FilesystemStore<Fe: FileEntry = FileEntryImpl> {
     /// per-blob `posix_fadvise(DONTNEED)` calls are skipped.
     evict_page_cache: bool,
     weak_self: Weak<Self>,
+    /// Where entries that left `evicting_map` through an insertion or a
+    /// lease release wait to be retired. See [`RetirementQueue`].
+    retirement: Arc<RetirementQueue<Fe>>,
     rename_fn: fn(&OsStr, &OsStr) -> Result<(), std::io::Error>,
     /// Limits concurrent write operations to prevent disk I/O saturation.
     /// A permit covers a write's flush, fsync and rename, so it is owned by
@@ -2351,6 +2848,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             read_buffer_size,
             evict_page_cache: spec.evict_page_cache,
             weak_self: weak_self.clone(),
+            retirement: Arc::new(RetirementQueue::new()),
             rename_fn,
             next_generation: AtomicU64::new(next_generation.inner()),
             write_semaphore,
@@ -2377,10 +2875,49 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     }
 
     /// Release a batch of action-input leases and trim retained entries once.
+    ///
+    /// The entries the release evicts are retired by the store's
+    /// [`RetirementQueue`]; this does not wait for them.
     pub async fn release_digests(&self, digests: &[DigestInfo]) {
-        self.evicting_map
-            .release_keys(digests.iter().map(|digest| StoreKey::Digest(*digest)))
-            .await;
+        let cleanup = self
+            .evicting_map
+            .release_keys_deferring_cleanup(digests.iter().map(|digest| StoreKey::Digest(*digest)));
+        self.retirement.enqueue_cleanup(cleanup);
+    }
+
+    /// Waits until every retirement queued so far, including unrefs handed to
+    /// detached tasks, has finished. For tests that check the effects of an
+    /// eviction after the write or release that caused it has returned.
+    pub async fn retirement_settled_for_test(&self) {
+        self.retirement.wait_settled().await;
+    }
+
+    /// The store's retirement accounting. See [`RetirementQueue`].
+    pub fn retirement_accounting(&self) -> RetirementAccounting {
+        self.retirement.accounting()
+    }
+
+    /// Sets the cap on queued plus reserved bytes that writes wait for (see
+    /// [`RetirementQueue::reserve`]). `None`, the default, makes reservations
+    /// count only. No configuration sets it: enabling it is a separate
+    /// decision.
+    /// Runs `hook` on the blocking pool after each successful retirement
+    /// rename of this store, before the entry records its new path, so a test
+    /// can stop a retirement at that point.
+    pub fn set_after_retire_rename_hook_for_test(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.shared_context.after_retire_rename.0.lock() = hook;
+    }
+
+    /// Hands `entry` to a detached `unref()`, as the drain does for an entry a
+    /// reader holds, so a test can cancel that task. `entry` must already be
+    /// out of the map.
+    pub fn detach_unref_for_test(&self, entry: Arc<Fe>) {
+        self.retirement.detach_unref(entry);
+    }
+
+    pub fn set_retirement_reservation_cap(&self, cap: Option<u64>) {
+        self.retirement.state.lock().cap = cap;
+        self.retirement.space_freed.notify_waiters();
     }
 
     fn get_and_update_generation(&self) -> Result<Generation, Error> {
@@ -2747,6 +3284,10 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             .ok_or_else(|| make_err!(Code::NotFound, "{digest} not found in filesystem store. This may indicate the file was evicted due to cache pressure. Consider increasing 'max_bytes' in your filesystem store's eviction_policy configuration."))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the reservation travels with the temp file it covers"
+    )]
     async fn update_file(
         self: Pin<&Self>,
         entry: Fe,
@@ -2754,6 +3295,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         final_key: StoreKey<'static>,
         mut reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
+        reservation: Option<SpaceReservation<Fe>>,
         trace: &Arc<WriteTrace>,
     ) -> Result<u64, Error> {
         trace.enter(WritePhase::Write);
@@ -2775,7 +3317,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         }
 
         upload_size.validate_size(data_size)?;
-        self.finalize_temp_file(entry, temp_file, data_size, final_key, trace)
+        self.finalize_temp_file(entry, temp_file, data_size, final_key, reservation, trace)
             .await?;
         Ok(data_size)
     }
@@ -2805,6 +3347,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         mut temp_file: FileSlot,
         data_size: u64,
         final_key: StoreKey<'static>,
+        reservation: Option<SpaceReservation<Fe>>,
         trace: &Arc<WriteTrace>,
     ) -> Result<(), Error> {
         let store = self
@@ -2818,7 +3361,9 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         // in a detached task that the caller cannot cancel (see issue #495).
         // It holds no write permit, so it may wait for open-file permits.
         trace.enter(WritePhase::DuplicateCheck);
-        let (is_duplicate, mut temp_file) =
+        // The reservation travels with the temp file: a caller cancelled
+        // while this task still holds the file leaves both to it.
+        let (is_duplicate, mut temp_file, reservation) =
             background_spawn!("filesystem_store_check_duplicate", {
                 let evicting_map = self.evicting_map.clone();
                 let (final_key, entry) = (final_key.clone(), entry.clone());
@@ -2832,7 +3377,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
                     )
                     .await;
                     trace.duplicate_checked(&is_duplicate);
-                    (is_duplicate, temp_file)
+                    (is_duplicate, temp_file, reservation)
                 }
             })
             .await
@@ -2893,6 +3438,8 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             }
             .await;
             drop(permit);
+            // Published (now counted by the map) or failed.
+            drop(reservation);
             let published = match published {
                 Ok(published) => published,
                 Err(err) => {
@@ -2907,10 +3454,11 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
                 }
                 AfterPublication::Superseded(_) => "superseded by a newer generation",
             };
+            // The write's retirement phase now only queues: the diagnostic
+            // records how many units it handed to the store's drain.
             trace.enter(WritePhase::Retire);
-            RETIRE_TRACE
-                .scope(trace.clone(), published.run_traced(&trace))
-                .await;
+            let queued = published.defer(&store.retirement);
+            trace.retirement_stage("queued", queued);
             trace.end(outcome.to_owned());
             Ok(())
         })
@@ -2920,6 +3468,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
 
     async fn emplace_file(&self, key: StoreKey<'static>, entry: Arc<Fe>) -> Result<(), Error> {
         let evicting_map = self.evicting_map.clone();
+        let retirement = self.retirement.clone();
         let rename_fn = self.rename_fn;
 
         // We need to guarantee that this will get to the end even if the parent future is dropped.
@@ -2963,8 +3512,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
 
             publish_file(&evicting_map, rename_fn, key, entry)
                 .await?
-                .run()
-                .await;
+                .defer(&retirement);
             Ok(())
         })
         .await
@@ -3085,6 +3633,14 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         // reader available to know that the populator is active.
         reader.peek().await?;
 
+        // Reserve before the temp file takes an open-file permit (see
+        // `RetirementQueue::reserve`). A write of unknown size reserves
+        // nothing: its size is known only once it has been written.
+        let reservation = match upload_size {
+            UploadSizeInfo::ExactSize(size) => Some(self.retirement.reserve(size).await),
+            UploadSizeInfo::MaxSize(_) => None,
+        };
+
         trace.enter(WritePhase::CreateTemp);
         let (entry, temp_file, temp_full_path) = self.make_temp_file(temp_key).await?;
 
@@ -3094,6 +3650,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             key.into_owned(),
             reader,
             upload_size,
+            reservation,
             trace,
         )
         .await
@@ -3112,6 +3669,8 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         trace: &Arc<WriteTrace>,
     ) -> Result<(), Error> {
         let temp_key = make_temp_key(&key);
+        // Reserve before the temp file takes an open-file permit.
+        let reservation = self.retirement.reserve(data.len() as u64).await;
         let (entry, mut temp_file, temp_full_path) = self
             .make_temp_file(temp_key)
             .await
@@ -3126,9 +3685,16 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
                 .err_tip(|| format!("Failed to write data to {}", temp_full_path.display()))?;
         }
 
-        self.finalize_temp_file(entry, temp_file, data.len() as u64, key.into_owned(), trace)
-            .await
-            .err_tip(|| "In filesystem store update_oneshot")
+        self.finalize_temp_file(
+            entry,
+            temp_file,
+            data.len() as u64,
+            key.into_owned(),
+            Some(reservation),
+            trace,
+        )
+        .await
+        .err_tip(|| "In filesystem store update_oneshot")
     }
 
     // Separated out so tests can use this

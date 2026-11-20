@@ -156,7 +156,8 @@ struct State<
     pending_entries_delta: i64,
 }
 
-type RemoveFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+/// A remove callback's pending work, as returned inside [`InsertCleanup`].
+pub type RemoveFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 // The remove callbacks and `unref()`s of entries that left the map run one at
 // a time: `run_removal_callbacks`, then `unref_all`. They are where a store
@@ -206,6 +207,20 @@ impl<T> Debug for InsertCleanup<T> {
             .field("items_to_unref", &self.items_to_unref.len())
             .field("removal_futures", &self.removal_futures.len())
             .finish()
+    }
+}
+
+impl<T> InsertCleanup<T> {
+    /// Whether the insertion or release displaced nothing.
+    pub fn is_empty(&self) -> bool {
+        self.items_to_unref.is_empty() && self.removal_futures.is_empty()
+    }
+
+    /// Splits the cleanup into its remove callbacks and the entries to
+    /// unref, for a caller that runs them itself. The contract is unchanged:
+    /// run every callback before any of the entries' `unref()`.
+    pub fn into_parts(self) -> (Vec<RemoveFuture>, Vec<T>) {
+        (self.removal_futures, self.items_to_unref)
     }
 }
 
@@ -1003,6 +1018,20 @@ where
         <It as IntoIterator>::IntoIter: Send,
         R: Borrow<Q> + Send,
     {
+        let cleanup = self.release_keys_deferring_cleanup(keys);
+        run_removal_callbacks(cleanup.removal_futures).await;
+        unref_all(&cleanup.items_to_unref).await;
+    }
+
+    /// Like [`Self::release_keys`], but returns the cleanup of the entries the
+    /// release evicted instead of running it, so a caller that retires
+    /// entries elsewhere (a filesystem store's retirement drain) need not wait
+    /// for it. The entries are already out of the map when this returns.
+    pub fn release_keys_deferring_cleanup<It, R>(&self, keys: It) -> InsertCleanup<T>
+    where
+        It: IntoIterator<Item = R>,
+        R: Borrow<Q>,
+    {
         let (items_to_unref, removal_futures) = {
             let mut state = self.state.lock();
             let mut released_any = false;
@@ -1022,8 +1051,10 @@ where
         };
 
         self.flush_cache_size_metrics();
-        run_removal_callbacks(removal_futures).await;
-        unref_all(&items_to_unref).await;
+        InsertCleanup {
+            items_to_unref,
+            removal_futures,
+        }
     }
 
     fn inner_insert_many<It>(
