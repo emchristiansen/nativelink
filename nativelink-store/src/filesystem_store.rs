@@ -21,6 +21,7 @@ use std::borrow::Cow;
 #[cfg(unix)]
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
+use std::io::SeekFrom;
 use std::sync::{Arc, Weak};
 use std::time::SystemTime;
 
@@ -39,17 +40,16 @@ use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair,
 };
 use nativelink_util::common::{DigestInfo, fs};
-use nativelink_util::evicting_map::{EvictingMap, EvictionSnapshot, LenEntry};
+use nativelink_util::evicting_map::{EvictingMap, EvictionSnapshot, InsertCleanup, LenEntry};
 use nativelink_util::fs::FileSlot;
 use nativelink_util::health_utils::{HealthRegistryBuilder, HealthStatus, HealthStatusIndicator};
-#[cfg(unix)]
 use nativelink_util::spawn_blocking;
 #[cfg(unix)]
 use nativelink_util::store_trait::RemoveItemCallback;
 use nativelink_util::store_trait::{
     RemoveCallback, StoreDriver, StoreKey, StoreKeyBorrow, StoreOptimizations, UploadSizeInfo,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt, Take};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, Take};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReadDirStream;
@@ -1176,6 +1176,21 @@ pub async fn check_duplicate_files<Fe>(
 where
     Fe: FileEntry,
 {
+    check_duplicate_files_with(evicting_map, key, entry, None).await
+}
+
+/// [`check_duplicate_files`], reading the new file through `open_temp_file`
+/// when its writer still holds it open. The check then needs one more
+/// open-file permit, for the existing file, rather than two.
+async fn check_duplicate_files_with<Fe>(
+    evicting_map: &Arc<FsEvictingMap<'_, Fe>>,
+    key: &StoreKey<'static>,
+    entry: &Arc<Fe>,
+    open_temp_file: Option<&mut FileSlot>,
+) -> Result<bool, Error>
+where
+    Fe: FileEntry,
+{
     let temp_file_encoded_file_path = entry.get_encoded_file_path().write().await;
     let maybe_existing_item = evicting_map.get(&key.borrow().into_owned()).await;
     if let Some(existing_item) = maybe_existing_item {
@@ -1190,7 +1205,21 @@ where
             let existing_path = existing_item_encoded_file_path.get_file_path();
             let temp_path = temp_file_encoded_file_path.get_file_path();
             trace!(?existing_path, ?temp_path, "Checking duplicate files");
-            let mut temp_file = fs::open_file(&temp_path, 0, file_length).await?;
+            let mut opened_temp_file = None;
+            let temp_file: &mut (dyn AsyncRead + Unpin + Send) = match open_temp_file {
+                Some(file) => {
+                    if let Err(err) = file.seek(SeekFrom::Start(0)).await {
+                        warn!(
+                            ?err,
+                            ?temp_path,
+                            "Failed to rewind temp file, skipping duplicate check"
+                        );
+                        return Ok(false);
+                    }
+                    file
+                }
+                None => opened_temp_file.insert(fs::open_file(&temp_path, 0, file_length).await?),
+            };
             let mut existing_file = match fs::open_file(&existing_path, 0, file_length).await {
                 Ok(file) => file,
                 Err(err) if err.code == Code::NotFound => {
@@ -1201,7 +1230,7 @@ where
                     );
                     // Removal calls unref(), which needs the path lock. Release
                     // both locks and the open file before running callbacks.
-                    drop(temp_file);
+                    drop(opened_temp_file);
                     drop(existing_item_encoded_file_path);
                     drop(temp_file_encoded_file_path);
                     evicting_map
@@ -1263,7 +1292,7 @@ where
                 "Identical files, so don't need to edit, skipping emplace"
             );
             drop(existing_file);
-            drop(temp_file);
+            drop(opened_temp_file);
             drop(existing_item_encoded_file_path);
             drop(temp_file_encoded_file_path);
             // Comparison can overlap eviction. An identical retired file no
@@ -1286,6 +1315,102 @@ where
         );
     }
     Ok(false)
+}
+
+/// What is left once a file is published, none of it part of publishing it.
+#[must_use = "displaced or superseded files are only retired when this is run"]
+#[derive(Debug)]
+enum AfterPublication<Fe> {
+    /// The file is in the map. Unref the entries its insertion replaced or
+    /// evicted.
+    Inserted(InsertCleanup<Arc<Fe>>),
+    /// A newer generation of the key was published first, so the map kept
+    /// that one. Retire this file too, so it cannot leak or reappear after a
+    /// restart.
+    Superseded(Arc<Fe>),
+}
+
+impl<Fe: FileEntry> AfterPublication<Fe> {
+    /// Retires the displaced or superseded files. This waits for open-file
+    /// permits (`unref()` renames them into the temp directory).
+    async fn run(self) {
+        match self {
+            Self::Inserted(cleanup) => drop(cleanup.run().await),
+            Self::Superseded(entry) => entry.unref().await,
+        }
+    }
+}
+
+/// Renames `entry`'s temp file to its content path for `key`, then inserts
+/// `entry` into `evicting_map` if no newer generation of `key` is there.
+/// Publishing waits for no open-file permit: `rename_fn` runs directly on the
+/// blocking pool, and retiring the files the insertion displaced is left to
+/// the returned [`AfterPublication`].
+async fn publish_file<Fe: FileEntry>(
+    evicting_map: &FsEvictingMap<'static, Fe>,
+    rename_fn: fn(&OsStr, &OsStr) -> Result<(), std::io::Error>,
+    key: StoreKey<'static>,
+    entry: Arc<Fe>,
+) -> Result<AfterPublication<Fe>, Error> {
+    // Each generation owns a distinct content path. Publish the file before
+    // inserting it into the map, so readers only observe completed renames.
+    // A delayed unref of another generation cannot touch this file.
+    let mut encoded_file_path = entry.get_encoded_file_path().write().await;
+
+    let final_path = get_file_path_raw(
+        &PathType::Content,
+        encoded_file_path.shared_context.as_ref(),
+        &key,
+        encoded_file_path.generation,
+        encoded_file_path.version,
+    );
+
+    let from_path = encoded_file_path.get_file_path();
+
+    // Renames between two directories on one filesystem are serialized in
+    // the kernel and can block for a long time, so the rename runs on the
+    // blocking pool rather than on a runtime thread, which would stall every
+    // other task scheduled on it.
+    let result = spawn_blocking!("filesystem_store_emplace_rename", {
+        let (from_path, final_path) = (
+            from_path.clone().into_owned(),
+            final_path.clone().into_owned(),
+        );
+        move || (rename_fn)(&from_path, &final_path)
+    })
+    .await
+    .map_err(Error::from)
+    .and_then(|renamed| renamed.map_err(Error::from))
+    .err_tip(|| {
+        format!(
+            "Failed to rename temp file to final path {}",
+            final_path.display()
+        )
+    });
+
+    if let Err(err) = result {
+        error!(?err, ?from_path, ?final_path, "Failed to rename file",);
+        // This entry was never visible in the map. Drop cleans up its
+        // temporary file and the previous generation remains usable.
+        return Err(err);
+    }
+    trace!(?key, "Finished emplace file");
+    encoded_file_path.path_type = PathType::Content;
+    encoded_file_path.key = key.clone();
+    // Insertion can unref this entry immediately under cache pressure.
+    drop(encoded_file_path);
+    let (inserted, cleanup) = evicting_map.insert_if_deferring_cleanup(
+        key.clone().into(),
+        entry.clone(),
+        |present, new| present.generation() < new.generation(),
+    );
+    if inserted {
+        Ok(AfterPublication::Inserted(cleanup))
+    } else {
+        info!(%key, "Newer generation already emplaced, dropping");
+        drop(cleanup);
+        Ok(AfterPublication::Superseded(entry))
+    }
 }
 
 /// Deletes a digest's `.exec` variant (see
@@ -1348,7 +1473,9 @@ pub struct FilesystemStore<Fe: FileEntry = FileEntryImpl> {
     weak_self: Weak<Self>,
     rename_fn: fn(&OsStr, &OsStr) -> Result<(), std::io::Error>,
     /// Limits concurrent write operations to prevent disk I/O saturation.
-    write_semaphore: Option<Semaphore>,
+    /// A permit covers a write's flush, fsync and rename, so it is owned by
+    /// the task doing that work (see [`FilesystemStore::finalize_temp_file`]).
+    write_semaphore: Option<Arc<Semaphore>>,
     /// A monotonic counter by which we stamp newly added files.
     next_generation: AtomicU64,
     /// See [`FlushCoalescer`]: amortizes the per-blob `F_FULLFSYNC` cost
@@ -1606,7 +1733,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             spec.read_buffer_size as usize
         };
         let write_semaphore = if spec.max_concurrent_writes > 0 {
-            Some(Semaphore::new(spec.max_concurrent_writes))
+            Some(Arc::new(Semaphore::new(spec.max_concurrent_writes)))
         } else {
             None
         };
@@ -1971,7 +2098,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
 
     async fn update_file(
         self: Pin<&Self>,
-        mut entry: Fe,
+        entry: Fe,
         mut temp_file: FileSlot,
         final_key: StoreKey<'static>,
         mut reader: DropCloserReadHalf,
@@ -1995,42 +2122,121 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         }
 
         upload_size.validate_size(data_size)?;
-        let permit = if let Some(sem) = &self.write_semaphore {
-            Some(sem.acquire().await.map_err(|err| {
-                Error::from_std_err(Code::Internal, &err).append("Write semaphore closed")
-            })?)
-        } else {
-            None
-        };
-
-        // tokio defers write errors to the next write or flush call, so without an explicit flush
-        // the final write's failure is silently swallowed by `sync_all`, and a truncated file would
-        // be renamed into the content path.
-        temp_file
-            .flush()
-            .await
-            .err_tip(|| "Failed to flush in filesystem store")?;
-        self.flush_durably(&temp_file)
-            .await
-            .err_tip(|| "Failed to sync in filesystem store")?;
-
-        drop(permit);
-
-        if self.evict_page_cache {
-            temp_file.advise_dontneed();
-        }
-        trace!(?temp_file, "Dropping file to update_file");
-        drop(temp_file);
-
-        *entry.data_size_mut() = data_size;
-        self.emplace_file(final_key, Arc::new(entry)).await?;
+        self.finalize_temp_file(entry, temp_file, data_size, final_key)
+            .await?;
         Ok(data_size)
     }
 
+    /// Makes a completely written temp file durable and publishes it as
+    /// `final_key`.
+    ///
+    /// The `max_concurrent_writes` permit bounds the flush, the fsync and the
+    /// publication (the rename and the map insertion), so it must be held
+    /// until they have really finished. Once the permit is granted, it moves
+    /// with the file and the entry into one detached task that does all of
+    /// that work and releases the permit only when it ends. Dropping the
+    /// caller can therefore never release the permit while its write is
+    /// still running: like the rename on its own before (see issue #495), the
+    /// write finishes, or fails and cleans up, without the caller.
+    ///
+    /// While it holds the permit, that task must not wait for an open-file
+    /// permit, nor for a lock that is held by a task waiting for one: writers
+    /// queued for the write permit keep their temp files, and with them
+    /// open-file permits, until they get it. So the duplicate check, which
+    /// opens the stored file and takes its entry's lock, runs before the
+    /// write permit is requested, and the cleanup of entries displaced by the
+    /// insertion runs after it is released.
+    async fn finalize_temp_file(
+        self: Pin<&Self>,
+        mut entry: Fe,
+        mut temp_file: FileSlot,
+        data_size: u64,
+        final_key: StoreKey<'static>,
+    ) -> Result<(), Error> {
+        let store = self
+            .get_arc()
+            .err_tip(|| "Filesystem store dropped while finalizing a write")?;
+        *entry.data_size_mut() = data_size;
+        let entry = Arc::new(entry);
+        // A blob identical to the stored one needs no second copy. The check
+        // can remove the stored entry, when it has expired or its file is
+        // gone, and then has to retire it, so like the publication it runs
+        // in a detached task that the caller cannot cancel (see issue #495).
+        // It holds no write permit, so it may wait for open-file permits.
+        let (is_duplicate, mut temp_file) =
+            background_spawn!("filesystem_store_check_duplicate", {
+                let evicting_map = self.evicting_map.clone();
+                let (final_key, entry) = (final_key.clone(), entry.clone());
+                async move {
+                    let is_duplicate = check_duplicate_files_with(
+                        &evicting_map,
+                        &final_key,
+                        &entry,
+                        Some(&mut temp_file),
+                    )
+                    .await;
+                    (is_duplicate, temp_file)
+                }
+            })
+            .await
+            .err_tip(|| "Failed to join duplicate check task in filesystem store")?;
+        if is_duplicate? {
+            return Ok(());
+        }
+        // Waiting for the permit may be cancelled: no protected work has
+        // started yet.
+        let permit = match &self.write_semaphore {
+            Some(sem) => Some(Arc::clone(sem).acquire_owned().await.map_err(|err| {
+                Error::from_std_err(Code::Internal, &err).append("Write semaphore closed")
+            })?),
+            None => None,
+        };
+        background_spawn!("filesystem_store_finalize_file", async move {
+            let published: Result<AfterPublication<Fe>, Error> = async {
+                // tokio defers write errors to the next write or flush call, so without an explicit flush
+                // the final write's failure is silently swallowed by `sync_all`, and a truncated file would
+                // be renamed into the content path.
+                temp_file
+                    .flush()
+                    .await
+                    .err_tip(|| "Failed to flush in filesystem store")?;
+                store
+                    .flush_durably(&temp_file)
+                    .await
+                    .err_tip(|| "Failed to sync in filesystem store")?;
+                // Lock the blob down as read-only before publishing it, as
+                // `emplace_file` does, but through the open file: setting
+                // permissions by path would take another open-file permit.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Err(err) = temp_file
+                        .as_ref()
+                        .set_permissions(std::fs::Permissions::from_mode(0o444))
+                        .await
+                    {
+                        warn!(?err, ?temp_file, "Failed to set CAS blob read-only");
+                    }
+                }
+
+                if store.evict_page_cache {
+                    temp_file.advise_dontneed();
+                }
+                trace!(?temp_file, "Dropping file to finalize_temp_file");
+                drop(temp_file);
+
+                publish_file(&store.evicting_map, store.rename_fn, final_key, entry).await
+            }
+            .await;
+            drop(permit);
+            published?.run().await;
+            Ok(())
+        })
+        .await
+        .err_tip(|| "Failed to join finalize task in filesystem store")?
+    }
+
     async fn emplace_file(&self, key: StoreKey<'static>, entry: Arc<Fe>) -> Result<(), Error> {
-        // Each generation owns a distinct content path. Publish the file before
-        // inserting it into the map, so readers only observe completed renames.
-        // A delayed unref of another generation cannot touch this file.
         let evicting_map = self.evicting_map.clone();
         let rename_fn = self.rename_fn;
 
@@ -2043,18 +2249,6 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             if check_duplicate_files(&evicting_map, &key, &entry).await? {
                 return Ok(());
             }
-
-            let mut encoded_file_path = entry.get_encoded_file_path().write().await;
-
-            let final_path = get_file_path_raw(
-                &PathType::Content,
-                encoded_file_path.shared_context.as_ref(),
-                &key,
-                encoded_file_path.generation,
-                encoded_file_path.version,
-            );
-
-            let from_path = encoded_file_path.get_file_path();
 
             // Lock the blob down as read-only *before* it lands at its final
             // content path, so every hardlink of it (the worker directory cache
@@ -2072,41 +2266,23 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
+                let from_path = entry
+                    .get_encoded_file_path()
+                    .read()
+                    .await
+                    .get_file_path()
+                    .into_owned();
                 if let Err(err) =
                     fs::set_permissions(&from_path, std::fs::Permissions::from_mode(0o444)).await
                 {
                     warn!(?err, ?from_path, "Failed to set CAS blob read-only");
                 }
             }
-            let result = (rename_fn)(&from_path, &final_path).err_tip(|| {
-                format!(
-                    "Failed to rename temp file to final path {}",
-                    final_path.display()
-                )
-            });
 
-            if let Err(err) = result {
-                error!(?err, ?from_path, ?final_path, "Failed to rename file",);
-                // This entry was never visible in the map. Drop cleans up its
-                // temporary file and the previous generation remains usable.
-                return Err(err);
-            }
-            trace!(?key, "Finished emplace file");
-            encoded_file_path.path_type = PathType::Content;
-            encoded_file_path.key = key.clone();
-            // Insertion can unref this entry immediately under cache pressure.
-            drop(encoded_file_path);
-            let (inserted, _) = evicting_map
-                .insert_if(key.clone().into(), entry.clone(), |present, new| {
-                    present.generation() < new.generation()
-                })
+            publish_file(&evicting_map, rename_fn, key, entry)
+                .await?
+                .run()
                 .await;
-            if !inserted {
-                // A newer upload completed first. Retire our unindexed content
-                // file too, so it cannot leak or reappear after a restart.
-                info!(%key, "Newer generation already emplaced, dropping");
-                entry.unref().await;
-            }
             Ok(())
         })
         .await
@@ -2302,7 +2478,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         }
 
         let temp_key = make_temp_key(&key);
-        let (mut entry, mut temp_file, temp_full_path) = self
+        let (entry, mut temp_file, temp_full_path) = self
             .make_temp_file(temp_key)
             .await
             .err_tip(|| "Failed to create temp file in filesystem store update_oneshot")?;
@@ -2315,32 +2491,9 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
                 .err_tip(|| format!("Failed to write data to {}", temp_full_path.display()))?;
         }
 
-        let _permit = if let Some(sem) = &self.write_semaphore {
-            Some(sem.acquire().await.map_err(|err| {
-                Error::from_std_err(Code::Internal, &err).append("Write semaphore closed")
-            })?)
-        } else {
-            None
-        };
-
-        // See comment in `update_file` above.
-        temp_file
-            .flush()
+        self.finalize_temp_file(entry, temp_file, data.len() as u64, key.into_owned())
             .await
-            .err_tip(|| "Failed to flush in filesystem store update_oneshot")?;
-        self.flush_durably(&temp_file)
-            .await
-            .err_tip(|| "Failed to sync in filesystem store update_oneshot")?;
-
-        drop(_permit);
-
-        if self.evict_page_cache {
-            temp_file.advise_dontneed();
-        }
-        drop(temp_file);
-
-        *entry.data_size_mut() = data.len() as u64;
-        self.emplace_file(key.into_owned(), Arc::new(entry)).await
+            .err_tip(|| "In filesystem store update_oneshot")
     }
 
     async fn update_with_whole_file(

@@ -39,8 +39,10 @@ use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::common::{DigestInfo, fs, make_temp_path};
 use nativelink_util::evicting_map::LenEntry;
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
-use nativelink_util::store_trait::{Store, StoreKey, StoreLike, UploadSizeInfo};
-use nativelink_util::{background_spawn, spawn};
+use nativelink_util::store_trait::{
+    RemoveItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
+};
+use nativelink_util::{background_spawn, spawn, spawn_blocking};
 use opentelemetry::context::{Context, FutureExt as OtelFutureExt};
 use parking_lot::Mutex;
 use pretty_assertions::assert_eq;
@@ -1868,9 +1870,30 @@ async fn executable_hardlink_source_created_once_and_readonly() -> Result<(), Er
     Ok(())
 }
 
-/// Scripted stand-in for `rename(2)` that lets a test hold or fail the renames
-/// publishing executable variants, in order. Every other rename (ordinary CAS
-/// publishes) passes straight through. Each test owns its own `static` gate,
+/// Which renames a [`RenameGate`] scripts. Every other rename passes straight
+/// through.
+#[cfg(target_family = "unix")]
+#[derive(Clone, Copy, Debug)]
+enum GatedRenames {
+    /// Renames publishing executable variants into `{content_path}.exec`.
+    ExecutableVariants,
+    /// Renames publishing ordinary blobs into the content directory.
+    ContentPublishes,
+}
+
+#[cfg(target_family = "unix")]
+impl GatedRenames {
+    fn selects(self, to: &OsStr) -> bool {
+        let into_executable_variants = to.to_string_lossy().contains(".exec/");
+        match self {
+            Self::ExecutableVariants => into_executable_variants,
+            Self::ContentPublishes => !into_executable_variants,
+        }
+    }
+}
+
+/// Scripted stand-in for `rename(2)` that lets a test hold or fail one kind of
+/// rename ([`GatedRenames`]), in order. Each test owns its own `static` gate,
 /// because a store takes its rename hook as a plain `fn` pointer.
 ///
 /// Only the writers a test expects can be held. A rename beyond that count is
@@ -1879,30 +1902,32 @@ async fn executable_hardlink_source_created_once_and_readonly() -> Result<(), Er
 /// than leaving it awaiting a writer that no release will ever reach.
 #[cfg(target_family = "unix")]
 #[derive(Debug)]
-struct ExecutableRenameGate {
-    state: std::sync::Mutex<ExecutableRenameState>,
+struct RenameGate {
+    gated: GatedRenames,
+    state: std::sync::Mutex<RenameGateState>,
     changed: std::sync::Condvar,
 }
 
 #[cfg(target_family = "unix")]
 #[derive(Debug)]
-struct ExecutableRenameState {
-    /// Executable renames that have started.
+struct RenameGateState {
+    /// Gated renames that have started.
     entered: u32,
-    /// Executable rename `i` proceeds only once `i < released`.
+    /// Gated rename `i` proceeds only once `i < released`.
     released: u32,
-    /// Bit `i` makes executable rename `i` fail instead of renaming.
+    /// Bit `i` makes gated rename `i` fail instead of renaming.
     fail_mask: u32,
-    /// Executable renames the test expects; rename `i >= expected` is an
+    /// Gated renames the test expects; rename `i >= expected` is an
     /// extra writer and fails immediately without waiting.
     expected: u32,
 }
 
 #[cfg(target_family = "unix")]
-impl ExecutableRenameGate {
-    const fn new(released: u32, fail_mask: u32, expected: u32) -> Self {
+impl RenameGate {
+    const fn new(gated: GatedRenames, released: u32, fail_mask: u32, expected: u32) -> Self {
         Self {
-            state: std::sync::Mutex::new(ExecutableRenameState {
+            gated,
+            state: std::sync::Mutex::new(RenameGateState {
                 entered: 0,
                 released,
                 fail_mask,
@@ -1913,7 +1938,7 @@ impl ExecutableRenameGate {
     }
 
     fn rename(&self, from: &OsStr, to: &OsStr) -> Result<(), std::io::Error> {
-        if !to.to_string_lossy().contains(".exec/") {
+        if !self.gated.selects(to) {
             return std::fs::rename(from, to);
         }
         let mut state = self.state.lock().unwrap();
@@ -1922,7 +1947,7 @@ impl ExecutableRenameGate {
         self.changed.notify_all();
         if index >= state.expected {
             return Err(std::io::Error::other(format!(
-                "unexpected extra executable writer (rename {index})"
+                "unexpected extra writer (rename {index})"
             )));
         }
         while index >= state.released {
@@ -1931,7 +1956,7 @@ impl ExecutableRenameGate {
         let fail = state.fail_mask & (1 << index) != 0;
         drop(state);
         if fail {
-            return Err(std::io::Error::other("executable publish blocked by test"));
+            return Err(std::io::Error::other("publish blocked by test"));
         }
         std::fs::rename(from, to)
     }
@@ -1940,12 +1965,16 @@ impl ExecutableRenameGate {
         self.state.lock().unwrap().entered
     }
 
+    fn released(&self) -> u32 {
+        self.state.lock().unwrap().released
+    }
+
     fn release(&self, released: u32) {
         self.state.lock().unwrap().released = released;
         self.changed.notify_all();
     }
 
-    /// Waits, without blocking the test runtime, until `count` executable
+    /// Waits, without blocking the test runtime, until `count` gated
     /// renames have started.
     async fn wait_entered(&self, count: u32) -> Result<(), Error> {
         for _ in 0..10_000 {
@@ -1956,9 +1985,26 @@ impl ExecutableRenameGate {
         }
         Err(make_err!(
             Code::DeadlineExceeded,
-            "Only {} of {count} executable renames started",
+            "Only {} of {count} gated renames started",
             self.entered()
         ))
+    }
+
+    /// Blocks until the test has released `released` renames, or until
+    /// `limit` passes, then releases them itself. Returns whether it had to.
+    /// Run it on a blocking-pool thread: a test whose runtime thread is stuck
+    /// inside a held rename cannot release it, so this is what ends that test.
+    fn release_after(&self, limit: Duration, released: u32) -> bool {
+        let state = self.state.lock().unwrap();
+        let (mut state, wait) = self
+            .changed
+            .wait_timeout_while(state, limit, |state| state.released < released)
+            .unwrap();
+        if wait.timed_out() {
+            state.released = released;
+            self.changed.notify_all();
+        }
+        wait.timed_out()
     }
 }
 
@@ -1966,7 +2012,7 @@ impl ExecutableRenameGate {
 /// strand a blocking-pool thread (and hang runtime shutdown) inside the gate.
 #[cfg(target_family = "unix")]
 #[derive(Debug)]
-struct ReleaseAllOnDrop(&'static ExecutableRenameGate);
+struct ReleaseAllOnDrop(&'static RenameGate);
 
 #[cfg(target_family = "unix")]
 impl Drop for ReleaseAllOnDrop {
@@ -2027,7 +2073,7 @@ fn assert_no_open_fd_for(path: &OsStr) -> Result<(), Error> {
 async fn executable_variant_retry_succeeds_after_failed_publish() -> Result<(), Error> {
     use std::os::unix::fs::MetadataExt;
 
-    static GATE: ExecutableRenameGate = ExecutableRenameGate::new(u32::MAX, 0b1, 2);
+    static GATE: RenameGate = RenameGate::new(GatedRenames::ExecutableVariants, u32::MAX, 0b1, 2);
     fn rename_fn(from: &OsStr, to: &OsStr) -> Result<(), std::io::Error> {
         GATE.rename(from, to)
     }
@@ -2106,7 +2152,7 @@ async fn executable_variant_retry_succeeds_after_failed_publish() -> Result<(), 
 #[cfg(target_family = "unix")]
 #[nativelink_test]
 async fn cancelled_executable_variant_caller_keeps_single_writer() -> Result<(), Error> {
-    static GATE: ExecutableRenameGate = ExecutableRenameGate::new(0, 0, 1);
+    static GATE: RenameGate = RenameGate::new(GatedRenames::ExecutableVariants, 0, 0, 1);
     fn rename_fn(from: &OsStr, to: &OsStr) -> Result<(), std::io::Error> {
         GATE.rename(from, to)
     }
@@ -2177,7 +2223,7 @@ async fn cancelled_executable_variant_caller_keeps_single_writer() -> Result<(),
 #[cfg(target_family = "unix")]
 #[nativelink_test]
 async fn executable_variant_waiters_and_newcomers_share_one_writer() -> Result<(), Error> {
-    static GATE: ExecutableRenameGate = ExecutableRenameGate::new(0, 0b1, 2);
+    static GATE: RenameGate = RenameGate::new(GatedRenames::ExecutableVariants, 0, 0b1, 2);
     fn rename_fn(from: &OsStr, to: &OsStr) -> Result<(), std::io::Error> {
         GATE.rename(from, to)
     }
@@ -3638,5 +3684,418 @@ async fn incomplete_whole_file_does_not_replace_existing_blob() -> Result<(), Er
         .unwrap_err();
     assert_eq!(error.code, Code::InvalidArgument);
     assert_eq!(store.get_part_unchunked(key, 0, None).await?, good);
+    Ok(())
+}
+
+/// Writes `value` through the streaming `update` entry point.
+#[cfg(target_family = "unix")]
+async fn stream_update(
+    store: &FilesystemStore<FileEntryImpl>,
+    digest: DigestInfo,
+    value: &'static str,
+) -> Result<u64, Error> {
+    let (mut tx, rx) = make_buf_channel_pair();
+    let (sent, updated) = tokio::join!(
+        async move {
+            tx.send(value.into()).await?;
+            tx.send_eof()
+        },
+        store.update(digest, rx, UploadSizeInfo::ExactSize(value.len() as u64))
+    );
+    sent?;
+    updated
+}
+
+/// Waits until no temporary file is left in `temp_path`. A failed write
+/// removes its temporary file from a background task, so this polls, within
+/// a bound.
+#[cfg(target_family = "unix")]
+async fn wait_for_empty_temp_dir(temp_path: &str) -> Result<(), Error> {
+    let dir = format!("{temp_path}/{DIGEST_FOLDER_V2}");
+    for _ in 0..10_000 {
+        if list_file_names(&dir).await?.is_empty() {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(1)).await;
+    }
+    Err(make_err!(
+        Code::DeadlineExceeded,
+        "Temporary files remain in {dir}: {:?}",
+        list_file_names(&dir).await?
+    ))
+}
+
+/// `max_concurrent_writes` bounds each write's fsync and rename, so with a
+/// limit of one a second write must not reach its rename until the first
+/// write's rename has really finished. The rename runs in a task that
+/// outlives a cancelled caller, so when `cancel_first` is set the first
+/// caller is cancelled while its rename is held: that task, not the caller,
+/// must keep the write permit.
+#[cfg(target_family = "unix")]
+async fn check_write_limit_spans_rename(
+    gate: &'static RenameGate,
+    rename_fn: fn(&OsStr, &OsStr) -> Result<(), std::io::Error>,
+    cancel_first: bool,
+) -> Result<(), Error> {
+    let _release = ReleaseAllOnDrop(gate);
+    let temp_path = make_temp_path("temp_path");
+    let store = FilesystemStore::<FileEntryImpl>::new_with_timeout_and_rename_fn(
+        &FilesystemSpec {
+            content_path: make_temp_path("content_path"),
+            temp_path: temp_path.clone(),
+            max_concurrent_writes: 1,
+            ..Default::default()
+        },
+        rename_fn,
+    )
+    .await?;
+    let first_digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let second_digest = DigestInfo::try_new(HASH2, VALUE2.len())?;
+
+    // The first write streams its data, takes the only permit and holds in
+    // its rename.
+    let first = background_spawn!("write_limit_first", {
+        let store = store.clone();
+        async move { stream_update(&store, first_digest, VALUE1).await }
+    });
+    gate.wait_entered(1).await?;
+    let first = if cancel_first {
+        // Awaiting the aborted task proves its future has been dropped.
+        first.abort();
+        let cancelled = tokio::time::timeout(TASK_JOIN_LIMIT, first)
+            .await
+            .expect("cancelled task did not finish within TASK_JOIN_LIMIT");
+        assert!(cancelled.is_err_and(|e| e.is_cancelled()));
+        None
+    } else {
+        Some(first)
+    };
+
+    // While it waits for the permit, the second write holds an open temp
+    // file, which tests that wait for every file in the process to close
+    // count; keep the wait short.
+    let mut second = background_spawn!("write_limit_second", {
+        let store = store.clone();
+        async move { store.update_oneshot(second_digest, VALUE2.into()).await }
+    });
+    if let Ok(early) = tokio::time::timeout(Duration::from_millis(500), &mut second).await {
+        panic!("second write finished while the first held the write limit: {early:?}");
+    }
+    // A second write let through would by now have synced and reached its
+    // own (held) rename.
+    assert_eq!(
+        gate.entered(),
+        1,
+        "a second write reached its rename while the first was still renaming"
+    );
+
+    gate.release(2);
+    join_bounded(second).await?;
+    if let Some(first) = first {
+        assert_eq!(join_bounded(first).await?, VALUE1.len() as u64);
+    }
+    // The second write got the permit only after the first write's task had
+    // finished, so the first blob, even a cancelled caller's, is published.
+    assert_eq!(gate.entered(), 2);
+    assert_eq!(
+        store.get_part_unchunked(first_digest, 0, None).await?,
+        VALUE1.as_bytes()
+    );
+    assert_eq!(
+        store.get_part_unchunked(second_digest, 0, None).await?,
+        VALUE2.as_bytes()
+    );
+    wait_for_empty_temp_dir(&temp_path).await
+}
+
+#[cfg(target_family = "unix")]
+#[nativelink_test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_limit_spans_rename() -> Result<(), Error> {
+    static GATE: RenameGate = RenameGate::new(GatedRenames::ContentPublishes, 0, 0, 2);
+    fn rename_fn(from: &OsStr, to: &OsStr) -> Result<(), std::io::Error> {
+        GATE.rename(from, to)
+    }
+    check_write_limit_spans_rename(&GATE, rename_fn, false).await
+}
+
+#[cfg(target_family = "unix")]
+#[nativelink_test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_limit_survives_cancelled_writer() -> Result<(), Error> {
+    static GATE: RenameGate = RenameGate::new(GatedRenames::ContentPublishes, 0, 0, 2);
+    fn rename_fn(from: &OsStr, to: &OsStr) -> Result<(), std::io::Error> {
+        GATE.rename(from, to)
+    }
+    check_write_limit_spans_rename(&GATE, rename_fn, true).await
+}
+
+/// A write whose rename fails must release the write permit and remove its
+/// temporary file, so later writes through both entry points still succeed.
+#[cfg(target_family = "unix")]
+#[nativelink_test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_rename_releases_write_limit() -> Result<(), Error> {
+    static GATE: RenameGate = RenameGate::new(GatedRenames::ContentPublishes, u32::MAX, 0b1, 3);
+    fn rename_fn(from: &OsStr, to: &OsStr) -> Result<(), std::io::Error> {
+        GATE.rename(from, to)
+    }
+    let _release = ReleaseAllOnDrop(&GATE);
+    let temp_path = make_temp_path("temp_path");
+    let store = FilesystemStore::<FileEntryImpl>::new_with_timeout_and_rename_fn(
+        &FilesystemSpec {
+            content_path: make_temp_path("content_path"),
+            temp_path: temp_path.clone(),
+            max_concurrent_writes: 1,
+            ..Default::default()
+        },
+        rename_fn,
+    )
+    .await?;
+    let first_digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let second_digest = DigestInfo::try_new(HASH2, VALUE2.len())?;
+
+    let err = store
+        .update_oneshot(first_digest, VALUE1.into())
+        .await
+        .expect_err("the first rename is made to fail");
+    assert!(
+        format!("{err:?}").contains("Failed to rename temp file to final path"),
+        "unexpected error: {err:?}"
+    );
+    assert!(store.has(first_digest).await?.is_none());
+    wait_for_empty_temp_dir(&temp_path).await?;
+
+    tokio::time::timeout(
+        TASK_JOIN_LIMIT,
+        store.update_oneshot(first_digest, VALUE1.into()),
+    )
+    .await
+    .expect("a write after a failed rename did not get the write permit")?;
+    let written = tokio::time::timeout(
+        TASK_JOIN_LIMIT,
+        stream_update(&store, second_digest, VALUE2),
+    )
+    .await
+    .expect("a streamed write after a failed rename did not get the write permit")?;
+    assert_eq!(written, VALUE2.len() as u64);
+    assert_eq!(GATE.entered(), 3);
+    assert_eq!(
+        store.get_part_unchunked(first_digest, 0, None).await?,
+        VALUE1.as_bytes()
+    );
+    assert_eq!(
+        store.get_part_unchunked(second_digest, 0, None).await?,
+        VALUE2.as_bytes()
+    );
+    wait_for_empty_temp_dir(&temp_path).await
+}
+
+/// A rename can block in the kernel for a long time (renames between two
+/// directories on one filesystem are serialized). It must therefore not run
+/// on a runtime thread: while one write's rename is held, other tasks on the
+/// same runtime keep running. This runtime has a single thread, so a rename
+/// run on it would block everything else, this test included; a
+/// blocking-pool watchdog then releases the rename and the test fails.
+#[cfg(target_family = "unix")]
+#[nativelink_test]
+async fn held_rename_does_not_block_other_tasks() -> Result<(), Error> {
+    const WATCHDOG_LIMIT: Duration = Duration::from_secs(10);
+    static GATE: RenameGate = RenameGate::new(GatedRenames::ContentPublishes, 0, 0, 1);
+    fn rename_fn(from: &OsStr, to: &OsStr) -> Result<(), std::io::Error> {
+        GATE.rename(from, to)
+    }
+    let _release = ReleaseAllOnDrop(&GATE);
+    let watchdog = spawn_blocking!("held_rename_watchdog", || GATE
+        .release_after(WATCHDOG_LIMIT, 1));
+    let store = FilesystemStore::<FileEntryImpl>::new_with_timeout_and_rename_fn(
+        &FilesystemSpec {
+            content_path: make_temp_path("content_path"),
+            temp_path: make_temp_path("temp_path"),
+            ..Default::default()
+        },
+        rename_fn,
+    )
+    .await?;
+    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+
+    let write = background_spawn!("held_rename_write", {
+        let store = store.clone();
+        async move { store.update_oneshot(digest, VALUE1.into()).await }
+    });
+    GATE.wait_entered(1).await?;
+
+    // While the rename is held, an unrelated task and a timer both complete.
+    let unrelated = background_spawn!("held_rename_unrelated", async { 7 });
+    assert_eq!(join_bounded(unrelated).await, 7);
+    sleep(Duration::from_millis(1)).await;
+    assert_eq!(
+        GATE.released(),
+        0,
+        "other tasks ran only after the watchdog released the rename: \
+         the held rename blocked the runtime thread"
+    );
+
+    GATE.release(1);
+    let watchdog_fired = tokio::time::timeout(TASK_JOIN_LIMIT, watchdog)
+        .await
+        .expect("watchdog did not finish within TASK_JOIN_LIMIT")
+        .expect("watchdog panicked");
+    assert!(!watchdog_fired, "the watchdog had to release the rename");
+    join_bounded(write).await?;
+    assert_eq!(GATE.entered(), 1);
+    assert_eq!(
+        store.get_part_unchunked(digest, 0, None).await?,
+        VALUE1.as_bytes()
+    );
+    Ok(())
+}
+
+/// A remove callback that does not finish until it is released, as a real
+/// callback doing filesystem work (`ExecutableVariantRemover`) may not.
+/// Records whether its future was dropped before it finished.
+#[derive(Debug, Default)]
+struct HeldRemoveCallback {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    finished: AtomicBool,
+    abandoned: AtomicBool,
+}
+
+impl HeldRemoveCallback {
+    async fn wait_entered(&self) {
+        tokio::time::timeout(TASK_JOIN_LIMIT, self.entered.notified())
+            .await
+            .expect("no remove callback started within TASK_JOIN_LIMIT");
+    }
+
+    async fn wait_finished(&self) {
+        tokio::time::timeout(TASK_JOIN_LIMIT, async {
+            while !self.finished.load(Ordering::Acquire) {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the remove callback did not finish within TASK_JOIN_LIMIT");
+    }
+}
+
+impl RemoveItemCallback for HeldRemoveCallback {
+    fn callback<'a>(
+        &'a self,
+        _store_key: StoreKey<'a>,
+    ) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        struct AbandonGuard<'a>(&'a HeldRemoveCallback);
+        impl Drop for AbandonGuard<'_> {
+            fn drop(&mut self) {
+                if !self.0.finished.load(Ordering::Acquire) {
+                    self.0.abandoned.store(true, Ordering::Release);
+                }
+            }
+        }
+        Box::pin(async move {
+            let _guard = AbandonGuard(self);
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.finished.store(true, Ordering::Release);
+        })
+    }
+}
+
+/// Starts a write of `VALUE1` to `digest` that reaches the duplicate check
+/// against the stored entry, waits until that check has removed the stored
+/// entry from the map and is running its remove callback, then cancels the
+/// writer. The removed entry must still be retired: its callback finishes
+/// once released and no temporary file is left behind.
+async fn cancel_upload_while_duplicate_check_removes_entry(
+    store: &Arc<FilesystemStore>,
+    temp_path: &str,
+    digest: DigestInfo,
+    callback: &HeldRemoveCallback,
+) -> Result<(), Error> {
+    let upload = background_spawn!("cancelled_upload_during_duplicate_check", {
+        let store = store.clone();
+        async move { store.update_oneshot(digest, VALUE1.into()).await }
+    });
+    callback.wait_entered().await;
+    assert_eq!(
+        store.get_evicting_map().len_for_test(),
+        0,
+        "the duplicate check removed the stored entry before its callback"
+    );
+    upload.abort();
+    assert!(
+        upload
+            .await
+            .expect_err("the upload was waiting on the callback")
+            .is_cancelled()
+    );
+    assert!(
+        !callback.abandoned.load(Ordering::Acquire),
+        "cancelling the writer abandoned the cleanup of the entry it removed"
+    );
+    callback.release.notify_one();
+    callback.wait_finished().await;
+    wait_for_empty_temp_dir(temp_path).await
+}
+
+/// The duplicate check runs before the write permit is requested, and its
+/// lookup reaps an expired stored entry. Cancelling the writer then must not
+/// abandon that entry's remove callbacks and `unref()`: otherwise its content
+/// file stays on disk, untracked by the map, and is loaded again at restart.
+#[nativelink_test]
+async fn cancelled_upload_still_retires_expired_entry() -> Result<(), Error> {
+    let content_path = make_temp_path("content_path");
+    let temp_path = make_temp_path("temp_path");
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: content_path.clone(),
+        temp_path: temp_path.clone(),
+        eviction_policy: Some(EvictionPolicy {
+            max_seconds: 1,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .await?;
+    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    store.update_oneshot(digest, VALUE1.into()).await?;
+    let old_file = content_file_path(&content_path, &digest.into()).await?;
+    let callback = Arc::new(HeldRemoveCallback::default());
+    store.clone().register_remove_callback(callback.clone())?;
+    // Expiry compares whole seconds of wall-clock time since the store was
+    // created: an entry inserted in second `s` expires in second `s + 2`.
+    sleep(Duration::from_millis(2100)).await;
+
+    cancel_upload_while_duplicate_check_removes_entry(&store, &temp_path, digest, &callback)
+        .await?;
+    assert!(
+        !Path::new(&old_file).exists(),
+        "the expired content file was left on disk"
+    );
+    assert!(!content_file_exists(&content_path, &digest.into()).await?);
+    assert_eq!(store.get_evicting_map().len_for_test(), 0);
+    Ok(())
+}
+
+/// As [`cancelled_upload_still_retires_expired_entry`], for the duplicate
+/// check's other removal: a stored entry whose file has disappeared from
+/// disk is dropped from the map when the check fails to open it.
+#[nativelink_test]
+async fn cancelled_upload_still_retires_stale_entry() -> Result<(), Error> {
+    let content_path = make_temp_path("content_path");
+    let temp_path = make_temp_path("temp_path");
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: content_path.clone(),
+        temp_path: temp_path.clone(),
+        ..Default::default()
+    })
+    .await?;
+    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    store.update_oneshot(digest, VALUE1.into()).await?;
+    std::fs::remove_file(content_file_path(&content_path, &digest.into()).await?)?;
+    let callback = Arc::new(HeldRemoveCallback::default());
+    store.clone().register_remove_callback(callback.clone())?;
+
+    cancel_upload_while_duplicate_check_removes_entry(&store, &temp_path, digest, &callback)
+        .await?;
+    assert!(!content_file_exists(&content_path, &digest.into()).await?);
+    assert_eq!(store.get_evicting_map().len_for_test(), 0);
     Ok(())
 }
