@@ -209,6 +209,68 @@ async fn writes_return_while_their_eviction_batch_is_held() -> Result<(), Error>
     Ok(())
 }
 
+// A drain that runs longer than its report interval reports the backlog in
+// the journal while it runs, and again when it has caught up; one that keeps
+// up within the interval logs neither at info level. Production exports no
+// metrics by default, so this is where a drain that has fallen behind shows.
+#[nativelink_test]
+async fn a_long_drain_reports_its_backlog() -> Result<(), Error> {
+    const N: usize = 40;
+    let _serial = SERIAL.lock().await;
+    let dirs = dirs();
+    let store = open_store(&dirs, N * SIZE, N * SIZE / 2).await?;
+    fill(&store, N - 1).await?;
+
+    // Within the default interval: the batch retires without a report.
+    write(&store, N).await?;
+    settle(&store).await;
+    logs_assert(|lines: &[&str]| match info_lines(lines) {
+        0 => Ok(()),
+        reports => Err(format!("{reports} info-level retirement reports")),
+    });
+
+    // A batch whose drain runs past a zero interval reports while it runs.
+    store.set_retirement_report_interval_for_test(Duration::ZERO);
+    let admission = store.hold_retirement_admission_for_test().await;
+    for index in N + 1..2 * N {
+        write(&store, index).await?;
+    }
+    let held = store.retirement_accounting();
+    assert!(held.queued_units > 0, "a batch is queued: {held:?}");
+    drop(admission);
+    settle(&store).await;
+    let store_field = format!("store={}", dirs.content);
+    logs_assert(|lines: &[&str]| {
+        let backlog = lines.iter().any(|line| {
+            line.contains(" INFO ")
+                && line.contains("Filesystem store retirement backlog")
+                && line.contains("queued_units=")
+                && line.contains(&store_field)
+        });
+        let caught_up = lines.iter().any(|line| {
+            line.contains(" INFO ") && line.contains("Filesystem store retirement drain caught up")
+        });
+        if backlog && caught_up {
+            Ok(())
+        } else {
+            Err(format!("backlog report {backlog}, caught-up report {caught_up}"))
+        }
+    });
+    Ok(())
+}
+
+/// Info-level retirement reports among `lines`.
+fn info_lines(lines: &[&str]) -> usize {
+    lines
+        .iter()
+        .filter(|line| {
+            line.contains(" INFO ")
+                && (line.contains("Filesystem store retirement backlog")
+                    || line.contains("Filesystem store retirement drain caught up"))
+        })
+        .count()
+}
+
 // Test 3: simultaneous writes cannot all pass the cap check. With a cap of 8
 // blobs, 32 writes that each hold their reservation (their data is not yet
 // complete) are admitted 8 at a time, and the waiters hold no open file.

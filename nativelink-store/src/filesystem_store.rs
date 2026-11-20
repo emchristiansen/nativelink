@@ -409,6 +409,11 @@ impl<Fe> RetirementState<Fe> {
 ///   prune of that directory.
 pub struct RetirementQueue<Fe> {
     state: parking_lot::Mutex<RetirementState<Fe>>,
+    /// The store's content path, naming the store in backlog reports.
+    content_path: String,
+    /// How long a drain runs between backlog reports, in milliseconds. See
+    /// [`RetirementDrain::run`].
+    report_every_ms: AtomicU64,
     /// Woken whenever `queued_bytes` or `reserved_bytes` decreases.
     space_freed: tokio::sync::Notify,
     /// Woken whenever the queue may have become settled.
@@ -444,9 +449,20 @@ pub struct RetirementAccounting {
     pub waiting_reservations: u64,
 }
 
+/// How long a drain runs before it reports the backlog, and between reports.
+///
+/// Production exports no metrics by default, so the journal is where a drain
+/// that has fallen behind shows; a drain that keeps up within this time logs
+/// nothing above debug.
+const RETIREMENT_REPORT_EVERY: Duration = Duration::from_secs(10);
+
 impl<Fe: FileEntry> RetirementQueue<Fe> {
-    fn new() -> Self {
+    fn new(content_path: String) -> Self {
         Self {
+            content_path,
+            report_every_ms: AtomicU64::new(
+                u64::try_from(RETIREMENT_REPORT_EVERY.as_millis()).unwrap_or(u64::MAX),
+            ),
             state: parking_lot::Mutex::new(RetirementState {
                 units: VecDeque::new(),
                 draining: false,
@@ -558,6 +574,10 @@ impl<Fe: FileEntry> RetirementQueue<Fe> {
             notified.await;
             drop(waiting);
         }
+    }
+
+    fn report_every(&self) -> Duration {
+        Duration::from_millis(self.report_every_ms.load(Ordering::Relaxed))
     }
 
     fn accounting(&self) -> RetirementAccounting {
@@ -690,7 +710,18 @@ struct RetirementDrain<Fe> {
 }
 
 impl<Fe: FileEntry> RetirementDrain<Fe> {
+    /// Runs queued units until the queue is empty.
+    ///
+    /// A run that lasts longer than the queue's report interval
+    /// ([`RETIREMENT_REPORT_EVERY`] by default) logs the backlog at info level
+    /// once per interval while it runs, and a summary when it catches up, so
+    /// a drain that has fallen behind is visible in the journal before it
+    /// shows as disk use. Shorter runs log their summary at debug level.
     async fn run(mut self) {
+        let started = Instant::now();
+        let mut last_report = started;
+        let mut units_run: u64 = 0;
+        let mut unref_bytes: u64 = 0;
         loop {
             {
                 let mut state = self.queue.state.lock();
@@ -699,6 +730,7 @@ impl<Fe: FileEntry> RetirementDrain<Fe> {
                     self.finished = true;
                     drop(state);
                     self.queue.settled.notify_waiters();
+                    self.report_caught_up(started, units_run, unref_bytes);
                     return;
                 };
                 self.current = Some(unit);
@@ -718,7 +750,44 @@ impl<Fe: FileEntry> RetirementDrain<Fe> {
                     self.queue.detach_unref(entry);
                 }
                 self.queue.release_queued(bytes);
+                unref_bytes = unref_bytes.saturating_add(bytes);
             }
+            units_run += 1;
+            if last_report.elapsed() >= self.queue.report_every() {
+                last_report = Instant::now();
+                let backlog = self.queue.accounting();
+                info!(
+                    store = %self.queue.content_path,
+                    units_run,
+                    unref_bytes,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    queued_units = backlog.queued_units,
+                    queued_bytes = backlog.queued_bytes,
+                    detached_in_flight = backlog.detached_in_flight,
+                    "Filesystem store retirement backlog"
+                );
+            }
+        }
+    }
+
+    fn report_caught_up(&self, started: Instant, units_run: u64, unref_bytes: u64) {
+        let elapsed = started.elapsed();
+        if elapsed >= self.queue.report_every() {
+            info!(
+                store = %self.queue.content_path,
+                units_run,
+                unref_bytes,
+                elapsed_ms = elapsed.as_millis(),
+                "Filesystem store retirement drain caught up"
+            );
+        } else {
+            debug!(
+                store = %self.queue.content_path,
+                units_run,
+                unref_bytes,
+                elapsed_ms = elapsed.as_millis(),
+                "Filesystem store retirement drain caught up"
+            );
         }
     }
 }
@@ -2844,6 +2913,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             })
             .ok();
 
+        let retirement = Arc::new(RetirementQueue::new(shared_context.content_path.clone()));
         Ok(Arc::new_cyclic(|weak_self| Self {
             shared_context,
             evicting_map,
@@ -2851,7 +2921,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             read_buffer_size,
             evict_page_cache: spec.evict_page_cache,
             weak_self: weak_self.clone(),
-            retirement: Arc::new(RetirementQueue::new()),
+            retirement,
             rename_fn,
             next_generation: AtomicU64::new(next_generation.inner()),
             write_semaphore,
@@ -2900,10 +2970,6 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         self.retirement.accounting()
     }
 
-    /// Sets the cap on queued plus reserved bytes that writes wait for (see
-    /// [`RetirementQueue::reserve`]). `None`, the default, makes reservations
-    /// count only. No configuration sets it: enabling it is a separate
-    /// decision.
     /// Runs `hook` on the blocking pool after each successful retirement
     /// rename of this store, before the entry records its new path, so a test
     /// can stop a retirement at that point.
@@ -2918,6 +2984,20 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         self.retirement.detach_unref(entry);
     }
 
+    /// Sets how long a retirement drain runs between backlog reports (see
+    /// [`RetirementDrain::run`]), so a test can see a report without waiting
+    /// [`RETIREMENT_REPORT_EVERY`].
+    pub fn set_retirement_report_interval_for_test(&self, every: Duration) {
+        self.retirement.report_every_ms.store(
+            u64::try_from(every.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Sets the cap on queued plus reserved bytes that writes wait for (see
+    /// [`RetirementQueue::reserve`]). `None`, the default, makes reservations
+    /// count only. No configuration sets it: enabling it is a separate
+    /// decision.
     pub fn set_retirement_reservation_cap(&self, cap: Option<u64>) {
         self.retirement.state.lock().cap = cap;
         self.retirement.space_freed.notify_waiters();
