@@ -8986,6 +8986,206 @@ exit 1
         Ok(())
     }
 
+    /// Runs `script` with `sh -c` in an action over `input_root_digest` on
+    /// `manager`, through preparation, execution, upload and cleanup.
+    #[cfg(target_os = "linux")]
+    async fn run_script_action(
+        manager: &Arc<RunningActionsManagerImpl>,
+        cas_store: &Arc<FastSlowStore>,
+        input_root_digest: DigestInfo,
+        script: &str,
+    ) -> Result<ActionResult, Error> {
+        const WORKER_ID: &str = "foo_worker_id";
+        let command = Command {
+            arguments: vec!["sh".to_string(), "-c".to_string(), script.to_string()],
+            working_directory: ".".to_string(),
+            environment_variables: vec![EnvironmentVariable {
+                name: "PATH".to_string(),
+                value: env::var("PATH").unwrap(),
+            }],
+            ..Default::default()
+        };
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let running_action = manager
+            .create_and_add_action(
+                WORKER_ID.to_string(),
+                StartExecute {
+                    request_metadata: None,
+                    execute_request: Some(ExecuteRequest {
+                        action_digest: Some(action_digest.into()),
+                        digest_function: ProtoDigestFunction::Sha256.into(),
+                        ..Default::default()
+                    }),
+                    operation_id: OperationId::default().to_string(),
+                    queued_timestamp: Some(make_system_time(1000).into()),
+                    platform: action.platform.clone(),
+                    worker_id: WORKER_ID.to_string(),
+                },
+            )
+            .await?;
+        // Boxed: two whole actions' futures inline overflow the test thread's
+        // stack.
+        Box::pin(run_action(running_action)).await
+    }
+
+    /// An action that leaves a read-only directory in its input tree must not
+    /// change the executable variant linked into it. Cleaning the tree used
+    /// to chmod every file it could not unlink to 0o600; under a read-only
+    /// directory that file is a hardlink of the store's shared 0o555 variant,
+    /// so the next action on this worker that linked the variant could no
+    /// longer run it (EACCES, exit 126).
+    #[cfg(target_os = "linux")]
+    #[nativelink_test]
+    async fn executable_input_runs_again_after_cleanup_of_a_readonly_input_directory()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const TOOL_CONTENT: &str = "#!/bin/sh\nexit 0\n";
+
+        let content_path = make_temp_path("content_path");
+        let (_fast_store, slow_store, cas_store, ac_store) =
+            setup_stores_at(content_path.clone(), None).await?;
+        let tool_digest = DigestInfo::new([37u8; 32], TOOL_CONTENT.len() as u64);
+        slow_store
+            .as_ref()
+            .update_oneshot(tool_digest, TOOL_CONTENT.into())
+            .await?;
+        let bin_digest = serialize_and_upload_message(
+            &Directory {
+                files: vec![FileNode {
+                    name: "tool".to_string(),
+                    digest: Some(tool_digest.into()),
+                    is_executable: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory {
+                directories: vec![DirectoryNode {
+                    name: "bin".to_string(),
+                    digest: Some(bin_digest.into()),
+                }],
+                ..Default::default()
+            },
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+        let manager = Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+            root_action_directory: root_action_directory.clone(),
+            execution_configuration: ExecutionConfiguration::default(),
+            cas_store: cas_store.clone(),
+            ac_store: Some(Store::new(ac_store.clone())),
+            historical_store: Store::new(cas_store.clone()),
+            upload_action_result_config: &UploadActionResultConfig {
+                upload_ac_results_strategy: UploadCacheResultsStrategy::Never,
+                ..Default::default()
+            },
+            max_action_timeout: Duration::MAX,
+            max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+            max_download_timeout: Duration::from_secs(DEFAULT_MAX_DOWNLOAD_TIMEOUT),
+            max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
+            max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
+            timeout_handled_externally: false,
+            active_input_leases: false,
+            readonly_input_mounts: Vec::new(),
+            directory_cache: None,
+            use_namespaces: use_namespaces(),
+        })?);
+
+        // Each action records the inode of the `bin/tool` it was given, so
+        // the test can tell that both linked the one variant cleanup kept.
+        let inode_dir = make_temp_path("tool_inodes");
+        fs::create_dir_all(&inode_dir).await?;
+        let read_inode = |name: &'static str| {
+            let path = format!("{inode_dir}/{name}");
+            async move {
+                let text = fs::read(&path).await?;
+                from_utf8(&text)?
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|err| make_input_err!("{path}: {err}"))
+            }
+        };
+
+        // The first action runs the tool, then leaves `bin` read-only, so
+        // cleanup cannot unlink `bin/tool` before it makes `bin` writable.
+        let first = run_script_action(
+            &manager,
+            &cas_store,
+            input_root_digest,
+            &format!("stat -c %i bin/tool > {inode_dir}/first && ./bin/tool && chmod 555 bin"),
+        )
+        .await?;
+        assert_eq!(first.exit_code, 0, "the first action runs the tool");
+        assert!(
+            fs::read_dir(&root_action_directory)
+                .await?
+                .as_mut()
+                .next_entry()
+                .await?
+                .is_none(),
+            "cleanup removed the first action's directory"
+        );
+        let variant_path = format!("{content_path}.exec/d2/{tool_digest}");
+        let variant = fs::metadata(&variant_path).await?;
+        assert_eq!(
+            variant.mode() & 0o777,
+            0o555,
+            "cleanup changed the mode of the shared executable variant"
+        );
+        assert_eq!(
+            read_inode("first").await?,
+            variant.ino(),
+            "the first action's tool was not the variant"
+        );
+
+        // A second action on the same worker and store links the same
+        // variant again and must still be able to run it.
+        let second = run_script_action(
+            &manager,
+            &cas_store,
+            input_root_digest,
+            &format!("stat -c %i bin/tool > {inode_dir}/second && ./bin/tool"),
+        )
+        .await?;
+        assert_eq!(
+            second.exit_code, 0,
+            "the second action could not run the reused executable variant"
+        );
+        assert_eq!(
+            read_inode("second").await?,
+            variant.ino(),
+            "the second action was not given the variant the first one used"
+        );
+        let variant_after = fs::metadata(&variant_path).await?;
+        assert_eq!(variant_after.ino(), variant.ino());
+        assert_eq!(variant_after.mode() & 0o777, 0o555);
+        Ok(())
+    }
+
     /// Regression for skipping the `pre_exec` hook when namespaces are off.
     /// With namespaces disabled (the default) the action spawn goes through
     /// `posix_spawn` instead of `fork`, and `process_group(0)` must still make
