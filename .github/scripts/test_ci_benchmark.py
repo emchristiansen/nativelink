@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
@@ -33,7 +34,8 @@ class BenchmarkTest(unittest.TestCase):
         cluster_job = workflow.split('  cluster:', 1)[1]
         for hosted_build in ('matrix:', 'baseline', 'prepare-nix', 'setup-bazel', 'bazel test'):
             self.assertNotIn(hosted_build, cluster_job)
-        self.assertEqual(workflow.count('python3 .github/scripts/cluster_ci.py'), 1)
+        # Once for the primary lane and once for the optional AWS lane.
+        self.assertEqual(workflow.count('python3 .github/scripts/cluster_ci.py'), 2)
         self.assertIn("inputs.repetitions || '1'", workflow)
         self.assertIn('group: cluster-ci-${{ github.ref }}', workflow)
         self.assertNotIn('flock -n', cluster_ci.BOOTSTRAP)
@@ -43,32 +45,24 @@ class BenchmarkTest(unittest.TestCase):
         self.assertNotIn(f'bazel_version: {pinned_version}',
                          Path('.github/workflows/native-bazel.yaml').read_text())
 
-    def test_pull_requests_use_rbe_without_retained_client_credentials(self):
+    def test_only_unlisted_forks_run_the_hosted_bazel_suite(self):
         workflow = Path('.github/workflows/parallel-cluster-ci.yaml').read_text()
         pr_job = workflow.split('  pull-request:', 1)[1].split('  cluster:', 1)[0]
-        self.assertIn("if: github.event_name == 'pull_request'", pr_job)
-        for privileged_setting in ('id-token:', 'cluster_ci.py', 'NL_GKE_', 'NL_GCP_',
-                                   'NATIVELINK_STAGING_API_KEY_RW'):
-            self.assertNotIn(privileged_setting, pr_job)
-        same_repository = 'github.event.pull_request.head.repo.full_name == github.repository'
-        self.assertIn(same_repository + " && 'cluster-ci-benchmark' || 'public-ci'", pr_job)
-        configuration = pr_job.split('      - name: Configure loadtest remote execution\n', 1)[1]
-        configuration = configuration.split('\n      - ', 1)[0]
-        self.assertIn('if: ' + same_repository, configuration)
-        self.assertIn('secrets.NATIVELINK_CLUSTER_API_KEY', configuration)
-        self.assertIn('ci_benchmark.py configure-pr', configuration)
-        public = pr_job.split('      - name: Setup NativeLink Cloud\n', 1)[1].split('\n      - ', 1)[0]
-        self.assertIn('if: github.event.pull_request.head.repo.full_name != github.repository', public)
-        self.assertNotIn('secrets.', public)
-        self.assertIn("grep -qx 'common --config=nl-rbe' user.bazelrc", pr_job)
+        self.assertIn("github.event_name == 'pull_request' &&", pr_job)
+        self.assertIn('github.event.pull_request.head.repo.full_name != github.repository', pr_job)
+        for setting in ('id-token:', 'cluster_ci.py', 'NL_GKE_', 'NL_GCP_', 'secrets.'):
+            self.assertNotIn(setting, pr_job)
+        self.assertIn('environment: public-ci', pr_job)
+        self.assertIn('ref: ${{ github.event.pull_request.base.sha }}', pr_job)
+        self.assertIn('python3 .github/scripts/ci_trust.py', pr_job)
+        for name in ('Setup NativeLink Cloud', 'Setup Bazel', 'Run project-pinned Bazel tests'):
+            step = pr_job.split('      - name: ' + name + '\n', 1)[1].split('\n      - ', 1)[0]
+            self.assertIn("if: steps.route.outputs.local == 'true'", step)
         self.assertIn('./tools/bazel-retry.sh test //...', pr_job)
         self.assertIn('--lockfile_mode=error', pr_job)
         self.assertNotIn('USE_BAZEL_VERSION', pr_job)
 
     def test_pr_rbe_configuration_and_missing_credentials(self):
-        workflow = Path('.github/workflows/parallel-cluster-ci.yaml').read_text()
-        guard = workflow.split('      - name: Require remote execution for repository PRs\n', 1)[1]
-        guard = textwrap.dedent(guard.split('        run: |\n', 1)[1].split('\n      - ', 1)[0])
         for private_credentials in (True, False):
             with self.subTest(private_credentials=private_credentials), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -85,10 +79,7 @@ class BenchmarkTest(unittest.TestCase):
                     else:
                         with self.assertRaisesRegex(ValueError, 'CI API key is missing'):
                             ci_benchmark.configure_pr(rc_file)
-                checked = subprocess.run(['bash', '-c', guard], cwd=root, env=env,
-                                         capture_output=True, text=True)
                 if private_credentials:
-                    self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
                     rc = rc_file.read_text()
                     flags = [shlex.split(line)[1] for line in rc.splitlines()]
                     expected, _ = ci_benchmark.configuration('cluster', env)
@@ -102,8 +93,6 @@ class BenchmarkTest(unittest.TestCase):
                     self.assertIn('common --config=nl-rbe', rc)
                     self.assertNotIn('private-test-key', rc)
                 else:
-                    self.assertNotEqual(checked.returncode, 0)
-                    self.assertIn('This PR requires remote execution', checked.stdout)
                     self.assertFalse(rc_file.exists())
 
     def test_web_only_changes_skip_bazel_lanes(self):
@@ -211,6 +200,58 @@ class BenchmarkTest(unittest.TestCase):
                        {'GITHUB_REF': 'refs/pull/1/merge'}, {'GITHUB_REF': 'refs/tags/v1'}):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 cluster_ci.payload({**env, **change}, 3)
+
+    def test_aws_lane_is_optional_and_uses_only_short_lived_credentials(self):
+        workflow = Path('.github/workflows/parallel-cluster-ci.yaml').read_text()
+        primary, aws_job = workflow.split('  cluster:', 1)[1].split('  cluster-aws:', 1)
+        # The primary lane is unchanged: it neither waits for nor depends on AWS.
+        for setting in ('NL_EKS_CLUSTER', 'configure-aws-credentials', 'cluster-ci-aws', 'continue-on-error'):
+            self.assertNotIn(setting, primary.split('\n  # The same build on the AWS deployment')[0])
+        self.assertIn('environment: cluster-ci-aws', aws_job)
+        self.assertIn('continue-on-error: true', aws_job)
+        self.assertIn("vars.NL_AWS_LANE == 'true'", aws_job)
+        # Reviewed code only: a pushed branch is built by the primary lane.
+        self.assertIn("github.ref == 'refs/heads/main'", aws_job)
+        self.assertNotIn('startsWith(github.ref', aws_job)
+        self.assertIn('id-token: write', aws_job)
+        # The log of this public repository shows a variable and masks a
+        # secret, so what locates the deployment is read from secrets.
+        for located in ('NL_AWS_DISPATCH_ROLE_ARN', 'NL_GKE_SERVER', 'NL_GKE_CA_DATA'):
+            self.assertIn('${{ secrets.%s }}' % located, aws_job)
+            self.assertNotIn('vars.%s ' % located, aws_job)
+        self.assertIn('mask-aws-account-id: true', aws_job)
+        self.assertRegex(aws_job, r'aws-actions/configure-aws-credentials@[a-f0-9]{40}\n')
+        # The result is read with a new token after the build, so the
+        # credentials must outlast the job.
+        session = int(re.search(r'role-duration-seconds: (\d+)', aws_job).group(1))
+        limit = int(re.search(r'timeout-minutes: (\d+)', aws_job).group(1))
+        self.assertGreater(session, limit * 60)
+        for stored_key in ('aws-access-key-id', 'aws-secret-access-key', 'AWS_SECRET_ACCESS_KEY'):
+            self.assertNotIn(stored_key, workflow)
+        self.assertNotIn('NL_GCP_', aws_job)
+        # The Bazel client by its own name: the Nix lane has a client of its own.
+        self.assertIn('NL_GKE_POD: ${{ vars.NL_GKE_BAZEL_POD }}', aws_job)
+        self.assertIn('name: cluster-ci-aws', aws_job)
+
+    def test_eks_tokens_come_from_the_job_role_and_stay_out_of_kubeconfig(self):
+        env = {'NL_EKS_CLUSTER': 'ci-acceleration', 'NL_AWS_REGION': 'us-east-2',
+               'NL_GKE_SERVER': 'https://cluster.example', 'NL_GKE_CA_DATA': 'public-ca',
+               'NL_GKE_NAMESPACE': 'test', 'AWS_SECRET_ACCESS_KEY': 'role-secret',
+               'AWS_SESSION_TOKEN': 'session-secret'}
+        config = cluster_ci.kubeconfig(env)
+        plugin = config['users'][0]['user']['exec']
+        self.assertEqual(plugin['command'], 'aws')
+        self.assertEqual(plugin['args'], ['eks', 'get-token', '--cluster-name', 'ci-acceleration',
+                                          '--region', 'us-east-2', '--output', 'json'])
+        self.assertNotIn('token', config['users'][0]['user'])
+        for secret in ('role-secret', 'session-secret'):
+            self.assertNotIn(secret, json.dumps(config))
+        for change in ({'NL_EKS_CLUSTER': 'ci; rm -rf /'}, {'NL_AWS_REGION': 'us-east-2 --profile x'}):
+            with self.assertRaises(ValueError):
+                cluster_ci.kubeconfig({**env, **change})
+        # Without an EKS cluster name the original federation plugin is used.
+        del env['NL_EKS_CLUSTER']
+        self.assertEqual(cluster_ci.kubeconfig(env)['users'][0]['user']['exec']['command'], sys.executable)
 
     def test_federation_keeps_tokens_out_of_kubeconfig(self):
         env = {'NL_GCP_PROVIDER': 'projects/123/locations/global/workloadIdentityPools/ci/providers/github',
