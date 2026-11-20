@@ -24,7 +24,7 @@ use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::io::SeekFrom;
 use std::sync::{Arc, Weak};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use async_lock::RwLock;
 #[cfg(unix)]
@@ -1458,6 +1458,302 @@ where
     Ok(false)
 }
 
+/// A stage of one `update` or `update_oneshot` write, for [`WriteTrace`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WritePhase {
+    /// `update` waiting for the first data before it takes a temp file.
+    AwaitData,
+    /// Creating and opening the temp file, including its open-file permit.
+    CreateTemp,
+    /// Receiving (for `update`) and writing the data into the temp file.
+    Write,
+    /// Comparing the upload with the key's stored file, in a detached task.
+    DuplicateCheck,
+    /// The duplicate check has ended; its result waits for the caller.
+    DuplicateChecked,
+    /// Waiting for a `max_concurrent_writes` permit.
+    WritePermit,
+    /// Flushing the temp file, in the detached finalizer like every stage
+    /// after it.
+    Flush,
+    /// `flush_durably`.
+    Sync,
+    /// Making the temp file read-only.
+    Chmod,
+    /// `publish_file`: the entry's path lock, the rename and the map
+    /// insertion.
+    Publish,
+    /// Retiring the files the publication displaced or superseded.
+    Retire,
+    /// The write has ended; its outcome says how.
+    Ended,
+}
+
+impl WritePhase {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::AwaitData => "await_data",
+            Self::CreateTemp => "create_temp",
+            Self::Write => "write",
+            Self::DuplicateCheck => "duplicate_check",
+            Self::DuplicateChecked => "duplicate_checked",
+            Self::WritePermit => "write_permit",
+            Self::Flush => "flush",
+            Self::Sync => "sync",
+            Self::Chmod => "chmod",
+            Self::Publish => "publish",
+            Self::Retire => "retire",
+            Self::Ended => "ended",
+        }
+    }
+
+    /// Whether the stage is one of the store's detached tasks, which
+    /// dropping the caller does not cancel, so the write's own stages go on
+    /// without the caller. For any other stage, dropping the caller ends the
+    /// write's stages, though a blocking operation it already started (such
+    /// as the temp file's open) still runs to its end.
+    const fn detached(self) -> bool {
+        matches!(
+            self,
+            Self::DuplicateCheck
+                | Self::Flush
+                | Self::Sync
+                | Self::Chmod
+                | Self::Publish
+                | Self::Retire
+        )
+    }
+}
+
+/// Where one write's time goes, measured on the monotonic clock, so that a
+/// write whose caller stopped waiting (an RPC deadline, for one) shows which
+/// stage it was in and whether that stage is detached, and the detached part
+/// of it reports how it ended. It records this one write only: it says
+/// nothing about other writes of the key, nor about what the map holds now.
+/// Nothing here changes what the write does or when.
+#[derive(Debug)]
+struct WriteTrace {
+    /// Tells apart concurrent writes of one key.
+    id: u64,
+    key: String,
+    started: Instant,
+    state: parking_lot::Mutex<WriteTraceState>,
+}
+
+#[derive(Debug)]
+struct WriteTraceState {
+    phase: WritePhase,
+    phase_started: Instant,
+    /// The stages finished so far, in order, with how long each took.
+    finished: Vec<(WritePhase, Duration)>,
+    /// The duplicate check's answer, once it has one.
+    duplicate: Option<bool>,
+    /// The duplicate check's failure, if it failed, as the write's outcome
+    /// would report it.
+    duplicate_failure: Option<String>,
+    /// Whether this write's publication inserted its file into the map. A
+    /// newer generation may have displaced it since; this is not whether the
+    /// key is stored now. It is set once `publish_file` has returned, so
+    /// during [`WritePhase::Publish`] the insertion may already have
+    /// happened while this is still false.
+    inserted: bool,
+    /// How the write ended, once it has.
+    outcome: Option<String>,
+    /// Whether the caller was dropped before the write returned to it.
+    caller_gone: bool,
+}
+
+impl WriteTraceState {
+    fn finished_stages(&self) -> String {
+        use core::fmt::Write as _;
+        let mut stages = String::new();
+        for (phase, took) in &self.finished {
+            if !stages.is_empty() {
+                stages.push(' ');
+            }
+            // Writing to a `String` cannot fail.
+            let _ = write!(stages, "{}={:.3}ms", phase.name(), took.as_secs_f64() * 1e3);
+        }
+        stages
+    }
+}
+
+impl WriteTrace {
+    fn start(key: &StoreKey<'_>, phase: WritePhase) -> Arc<Self> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let now = Instant::now();
+        Arc::new(Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            key: key.as_str().into_owned(),
+            started: now,
+            state: parking_lot::Mutex::new(WriteTraceState {
+                phase,
+                phase_started: now,
+                finished: Vec::new(),
+                duplicate: None,
+                duplicate_failure: None,
+                inserted: false,
+                outcome: None,
+                caller_gone: false,
+            }),
+        })
+    }
+
+    fn enter(&self, phase: WritePhase) {
+        self.enter_locked(&mut self.state.lock(), phase);
+    }
+
+    fn enter_locked(&self, state: &mut WriteTraceState, phase: WritePhase) {
+        let now = Instant::now();
+        let left = core::mem::replace(&mut state.phase, phase);
+        let took = now.saturating_duration_since(state.phase_started);
+        state.finished.push((left, took));
+        state.phase_started = now;
+        trace!(
+            key = %self.key,
+            phase = %phase.name(),
+            write_id = self.id,
+            "Filesystem store write stage"
+        );
+    }
+
+    /// Records the duplicate check's answer. With the caller already gone,
+    /// nothing takes the answer up, so the write ends here; if the caller goes
+    /// later, before taking the answer up, [`Self::caller_gone`] ends it.
+    fn duplicate_checked(&self, is_duplicate: &Result<bool, Error>) {
+        let outcome = {
+            let mut state = self.state.lock();
+            state.duplicate = is_duplicate.as_ref().ok().copied();
+            state.duplicate_failure = is_duplicate
+                .as_ref()
+                .err()
+                .map(|err| format!("duplicate check failed: {err:?}"));
+            self.enter_locked(&mut state, WritePhase::DuplicateChecked);
+            state.caller_gone.then(|| {
+                Self::untaken_outcome(
+                    &state,
+                    "not inserted: no caller took up the duplicate check".to_owned(),
+                )
+            })
+        };
+        if let Some(outcome) = outcome {
+            self.end(outcome);
+        }
+    }
+
+    /// The outcome of a write whose duplicate check answered but whose caller
+    /// never took the answer up: the check's own failure or match, if it had
+    /// one, else `otherwise`. Both orders of the answer and the caller's going
+    /// report it alike.
+    fn untaken_outcome(state: &WriteTraceState, otherwise: String) -> String {
+        if let Some(failure) = &state.duplicate_failure {
+            failure.clone()
+        } else if state.duplicate == Some(true) {
+            "duplicate of the stored file".to_owned()
+        } else {
+            otherwise
+        }
+    }
+
+    fn inserted(&self) {
+        self.state.lock().inserted = true;
+    }
+
+    /// Records how the detached part of the write ended, and reports it if
+    /// the caller is gone, as nobody else will.
+    fn end(&self, outcome: String) {
+        let mut state = self.state.lock();
+        self.enter_locked(&mut state, WritePhase::Ended);
+        if state.caller_gone {
+            warn!(
+                key = %self.key,
+                write_id = self.id,
+                elapsed_ms = self.started.elapsed().as_millis(),
+                inserted = state.inserted,
+                outcome = %outcome,
+                stages = %state.finished_stages(),
+                "Filesystem store write ended after its caller stopped waiting"
+            );
+        }
+        state.outcome = Some(outcome);
+    }
+
+    /// Records that the caller stopped waiting, and reports where the write
+    /// was. Outside the detached stages nothing of the write goes on without
+    /// its caller (a finished duplicate check's answer, for one, is never
+    /// taken up), so the write ends here, under the same lock that a detached
+    /// stage ending takes: whichever comes second sees the first.
+    fn caller_gone(&self) {
+        let mut state = self.state.lock();
+        state.caller_gone = true;
+        let dropped_in = state.phase;
+        let phase_ms = state.phase_started.elapsed().as_millis();
+        if !dropped_in.detached() && dropped_in != WritePhase::Ended {
+            let stopped = format!(
+                "not inserted: its caller stopped waiting in {}",
+                dropped_in.name()
+            );
+            let outcome = if dropped_in == WritePhase::DuplicateChecked {
+                Self::untaken_outcome(&state, stopped)
+            } else {
+                stopped
+            };
+            self.enter_locked(&mut state, WritePhase::Ended);
+            state.outcome = Some(outcome);
+        }
+        warn!(
+            key = %self.key,
+            phase = %dropped_in.name(),
+            detached_stage = dropped_in.detached(),
+            inserted = state.inserted,
+            write_id = self.id,
+            elapsed_ms = self.started.elapsed().as_millis(),
+            phase_ms,
+            duplicate = ?state.duplicate,
+            outcome = ?state.outcome,
+            stages = %state.finished_stages(),
+            "Caller stopped waiting for a filesystem store write"
+        );
+    }
+
+    fn returned(&self, result: Result<(), &Error>) {
+        let state = self.state.lock();
+        debug!(
+            key = %self.key,
+            phase = %state.phase.name(),
+            inserted = state.inserted,
+            write_id = self.id,
+            elapsed_ms = self.started.elapsed().as_millis(),
+            duplicate = ?state.duplicate,
+            outcome = ?state.outcome,
+            ?result,
+            stages = %state.finished_stages(),
+            "Filesystem store write returned"
+        );
+    }
+}
+
+/// Held by the caller of one write. Dropped without [`Self::returned`], it
+/// reports that the caller stopped waiting, and where the write was.
+#[derive(Debug)]
+struct CallerWaiting(Option<Arc<WriteTrace>>);
+
+impl CallerWaiting {
+    fn returned<T>(mut self, result: &Result<T, Error>) {
+        if let Some(trace) = self.0.take() {
+            trace.returned(result.as_ref().map(|_| ()));
+        }
+    }
+}
+
+impl Drop for CallerWaiting {
+    fn drop(&mut self) {
+        if let Some(trace) = self.0.take() {
+            trace.caller_gone();
+        }
+    }
+}
+
 /// What is left once a file is published, none of it part of publishing it.
 #[must_use = "displaced or superseded files are only retired when this is run"]
 #[derive(Debug)]
@@ -2381,7 +2677,9 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         final_key: StoreKey<'static>,
         mut reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
+        trace: &Arc<WriteTrace>,
     ) -> Result<u64, Error> {
+        trace.enter(WritePhase::Write);
         let mut data_size = 0;
         loop {
             let mut data = reader
@@ -2400,7 +2698,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         }
 
         upload_size.validate_size(data_size)?;
-        self.finalize_temp_file(entry, temp_file, data_size, final_key)
+        self.finalize_temp_file(entry, temp_file, data_size, final_key, trace)
             .await?;
         Ok(data_size)
     }
@@ -2430,6 +2728,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         mut temp_file: FileSlot,
         data_size: u64,
         final_key: StoreKey<'static>,
+        trace: &Arc<WriteTrace>,
     ) -> Result<(), Error> {
         let store = self
             .get_arc()
@@ -2441,10 +2740,12 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         // gone, and then has to retire it, so like the publication it runs
         // in a detached task that the caller cannot cancel (see issue #495).
         // It holds no write permit, so it may wait for open-file permits.
+        trace.enter(WritePhase::DuplicateCheck);
         let (is_duplicate, mut temp_file) =
             background_spawn!("filesystem_store_check_duplicate", {
                 let evicting_map = self.evicting_map.clone();
                 let (final_key, entry) = (final_key.clone(), entry.clone());
+                let trace = trace.clone();
                 async move {
                     let is_duplicate = check_duplicate_files_with(
                         &evicting_map,
@@ -2453,14 +2754,17 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
                         Some(&mut temp_file),
                     )
                     .await;
+                    trace.duplicate_checked(&is_duplicate);
                     (is_duplicate, temp_file)
                 }
             })
             .await
             .err_tip(|| "Failed to join duplicate check task in filesystem store")?;
         if is_duplicate? {
+            trace.end("duplicate of the stored file".to_owned());
             return Ok(());
         }
+        trace.enter(WritePhase::WritePermit);
         // Waiting for the permit may be cancelled: no protected work has
         // started yet.
         let permit = match &self.write_semaphore {
@@ -2469,6 +2773,8 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             })?),
             None => None,
         };
+        trace.enter(WritePhase::Flush);
+        let trace = trace.clone();
         background_spawn!("filesystem_store_finalize_file", async move {
             let published: Result<AfterPublication<Fe>, Error> = async {
                 // tokio defers write errors to the next write or flush call, so without an explicit flush
@@ -2478,10 +2784,12 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
                     .flush()
                     .await
                     .err_tip(|| "Failed to flush in filesystem store")?;
+                trace.enter(WritePhase::Sync);
                 store
                     .flush_durably(&temp_file)
                     .await
                     .err_tip(|| "Failed to sync in filesystem store")?;
+                trace.enter(WritePhase::Chmod);
                 // Lock the blob down as read-only before publishing it, as
                 // `emplace_file` does, but through the open file: setting
                 // permissions by path would take another open-file permit.
@@ -2503,11 +2811,28 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
                 trace!(?temp_file, "Dropping file to finalize_temp_file");
                 drop(temp_file);
 
+                trace.enter(WritePhase::Publish);
                 publish_file(&store.evicting_map, store.rename_fn, final_key, entry).await
             }
             .await;
             drop(permit);
-            published?.run().await;
+            let published = match published {
+                Ok(published) => published,
+                Err(err) => {
+                    trace.end(format!("failed: {err:?}"));
+                    return Err(err);
+                }
+            };
+            let outcome = match &published {
+                AfterPublication::Inserted(_) => {
+                    trace.inserted();
+                    "inserted"
+                }
+                AfterPublication::Superseded(_) => "superseded by a newer generation",
+            };
+            trace.enter(WritePhase::Retire);
+            published.run().await;
+            trace.end(outcome.to_owned());
             Ok(())
         })
         .await
@@ -2664,6 +2989,69 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             .map(|coalescer| coalescer.full_flush_count.load(Ordering::Relaxed))
     }
 
+    async fn update_traced(
+        self: Pin<&Self>,
+        key: StoreKey<'_>,
+        mut reader: DropCloserReadHalf,
+        upload_size: UploadSizeInfo,
+        trace: &Arc<WriteTrace>,
+    ) -> Result<u64, Error> {
+        let temp_key = make_temp_key(&key);
+
+        // There's a possibility of deadlock here where we take all of the
+        // file semaphores with make_and_open_file and the semaphores for
+        // whatever is populating reader is exhasted on the threads that
+        // have the FileSlots and not on those which can't.  To work around
+        // this we don't take the FileSlot until there's something on the
+        // reader available to know that the populator is active.
+        reader.peek().await?;
+
+        trace.enter(WritePhase::CreateTemp);
+        let (entry, temp_file, temp_full_path) = self.make_temp_file(temp_key).await?;
+
+        self.update_file(
+            entry,
+            temp_file,
+            key.into_owned(),
+            reader,
+            upload_size,
+            trace,
+        )
+        .await
+        .err_tip(|| {
+            format!(
+                "While processing with temp file {}",
+                temp_full_path.display()
+            )
+        })
+    }
+
+    async fn update_oneshot_traced(
+        self: Pin<&Self>,
+        key: StoreKey<'_>,
+        data: Bytes,
+        trace: &Arc<WriteTrace>,
+    ) -> Result<(), Error> {
+        let temp_key = make_temp_key(&key);
+        let (entry, mut temp_file, temp_full_path) = self
+            .make_temp_file(temp_key)
+            .await
+            .err_tip(|| "Failed to create temp file in filesystem store update_oneshot")?;
+
+        trace.enter(WritePhase::Write);
+        // Write directly without channel overhead
+        if !data.is_empty() {
+            temp_file
+                .write_all(&data)
+                .await
+                .err_tip(|| format!("Failed to write data to {}", temp_full_path.display()))?;
+        }
+
+        self.finalize_temp_file(entry, temp_file, data.len() as u64, key.into_owned(), trace)
+            .await
+            .err_tip(|| "In filesystem store update_oneshot")
+    }
+
     // Separated out so tests can use this
     pub async fn make_temp_file(
         &self,
@@ -2743,26 +3131,11 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             return Ok(0);
         }
 
-        let temp_key = make_temp_key(&key);
-
-        // There's a possibility of deadlock here where we take all of the
-        // file semaphores with make_and_open_file and the semaphores for
-        // whatever is populating reader is exhasted on the threads that
-        // have the FileSlots and not on those which can't.  To work around
-        // this we don't take the FileSlot until there's something on the
-        // reader available to know that the populator is active.
-        reader.peek().await?;
-
-        let (entry, temp_file, temp_full_path) = self.make_temp_file(temp_key).await?;
-
-        self.update_file(entry, temp_file, key.into_owned(), reader, upload_size)
-            .await
-            .err_tip(|| {
-                format!(
-                    "While processing with temp file {}",
-                    temp_full_path.display()
-                )
-            })
+        let trace = WriteTrace::start(&key, WritePhase::AwaitData);
+        let caller = CallerWaiting(Some(trace.clone()));
+        let result = self.update_traced(key, reader, upload_size, &trace).await;
+        caller.returned(&result);
+        result
     }
 
     fn optimized_for(&self, optimization: StoreOptimizations) -> bool {
@@ -2778,23 +3151,11 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             return Ok(());
         }
 
-        let temp_key = make_temp_key(&key);
-        let (entry, mut temp_file, temp_full_path) = self
-            .make_temp_file(temp_key)
-            .await
-            .err_tip(|| "Failed to create temp file in filesystem store update_oneshot")?;
-
-        // Write directly without channel overhead
-        if !data.is_empty() {
-            temp_file
-                .write_all(&data)
-                .await
-                .err_tip(|| format!("Failed to write data to {}", temp_full_path.display()))?;
-        }
-
-        self.finalize_temp_file(entry, temp_file, data.len() as u64, key.into_owned())
-            .await
-            .err_tip(|| "In filesystem store update_oneshot")
+        let trace = WriteTrace::start(&key, WritePhase::CreateTemp);
+        let caller = CallerWaiting(Some(trace.clone()));
+        let result = self.update_oneshot_traced(key, data, &trace).await;
+        caller.returned(&result);
+        result
     }
 
     async fn update_with_whole_file(
@@ -3145,5 +3506,101 @@ mod retirement_admission_tests {
         second.await.unwrap()?;
         assert_eq!(ctx.retirement.available_permits(), 1);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod write_trace_tests {
+    use std::borrow::Cow;
+
+    use nativelink_error::{Error, make_err};
+    use nativelink_util::store_trait::StoreKey;
+
+    use super::{CallerWaiting, WritePhase, WriteTrace};
+
+    fn trace_in(phase: WritePhase) -> (std::sync::Arc<WriteTrace>, CallerWaiting) {
+        let trace = WriteTrace::start(&StoreKey::Str(Cow::Borrowed("key")), WritePhase::CreateTemp);
+        trace.enter(phase);
+        let caller = CallerWaiting(Some(trace.clone()));
+        (trace, caller)
+    }
+
+    fn check_failure() -> Error {
+        make_err!(nativelink_error::Code::Internal, "check failed")
+    }
+
+    /// Either order reports a failed duplicate check as this same outcome.
+    fn check_failure_outcome() -> String {
+        format!("duplicate check failed: {:?}", check_failure())
+    }
+
+    fn end_of(trace: &WriteTrace) -> (WritePhase, Option<String>) {
+        let state = trace.state.lock();
+        (state.phase, state.outcome.clone())
+    }
+
+    /// The duplicate check answers, then the caller goes before taking the
+    /// answer up: the caller's going ends the write.
+    #[test]
+    fn caller_gone_after_the_duplicate_check_answered_ends_the_write() {
+        for (answer, outcome) in [
+            (
+                Ok(false),
+                "not inserted: its caller stopped waiting in duplicate_checked".to_owned(),
+            ),
+            (Ok(true), "duplicate of the stored file".to_owned()),
+            (Err(check_failure()), check_failure_outcome()),
+        ] {
+            let (trace, caller) = trace_in(WritePhase::DuplicateCheck);
+            trace.duplicate_checked(&answer);
+            assert_eq!(
+                end_of(&trace).1,
+                None,
+                "the caller may still take the answer up"
+            );
+            drop(caller);
+            assert_eq!(end_of(&trace), (WritePhase::Ended, Some(outcome.clone())));
+        }
+    }
+
+    /// The caller goes while the duplicate check runs: the check's answer
+    /// ends the write.
+    #[test]
+    fn duplicate_check_answering_after_the_caller_went_ends_the_write() {
+        for (answer, outcome) in [
+            (
+                Ok(false),
+                "not inserted: no caller took up the duplicate check".to_owned(),
+            ),
+            (Ok(true), "duplicate of the stored file".to_owned()),
+            (Err(check_failure()), check_failure_outcome()),
+        ] {
+            let (trace, caller) = trace_in(WritePhase::DuplicateCheck);
+            drop(caller);
+            assert_eq!(
+                end_of(&trace),
+                (WritePhase::DuplicateCheck, None),
+                "the check goes on without the caller"
+            );
+            trace.duplicate_checked(&answer);
+            assert_eq!(end_of(&trace), (WritePhase::Ended, Some(outcome.clone())));
+        }
+    }
+
+    /// A caller that took its result is not gone, and a detached stage does
+    /// not end with the caller.
+    #[test]
+    fn returned_caller_is_not_gone_and_detached_stages_outlive_the_caller() {
+        let (trace, caller) = trace_in(WritePhase::Publish);
+        caller.returned(&Ok::<(), Error>(()));
+        assert!(!trace.state.lock().caller_gone);
+        let (trace, caller) = trace_in(WritePhase::Retire);
+        drop(caller);
+        assert_eq!(end_of(&trace), (WritePhase::Retire, None));
+        trace.end("inserted".to_owned());
+        assert_eq!(
+            end_of(&trace),
+            (WritePhase::Ended, Some("inserted".to_owned()))
+        );
     }
 }

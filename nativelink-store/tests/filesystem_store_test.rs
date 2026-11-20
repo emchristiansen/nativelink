@@ -4861,3 +4861,367 @@ fn check_overlapping_retirements(
         Ok(())
     })
 }
+
+/// How many of this test's log lines contain `part`.
+#[cfg(target_family = "unix")]
+fn count_log_lines(
+    logs_assert: impl Fn(&dyn Fn(&[&str]) -> Result<(), String>),
+    part: &str,
+) -> usize {
+    let count = core::cell::Cell::new(0);
+    logs_assert(&|lines: &[&str]| {
+        count.set(lines.iter().filter(|line| line.contains(part)).count());
+        Ok(())
+    });
+    count.get()
+}
+
+/// Waits until `count` of this test's log lines contain `part`.
+#[cfg(target_family = "unix")]
+async fn wait_for_log_lines(
+    logs_assert: impl Fn(&dyn Fn(&[&str]) -> Result<(), String>) + Copy + Send + Sync,
+    part: &str,
+    count: usize,
+) -> Result<(), Error> {
+    tokio::time::timeout(TASK_JOIN_LIMIT, async {
+        while count_log_lines(logs_assert, part) < count {
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        make_err!(
+            Code::DeadlineExceeded,
+            "never logged {count} lines with {part}"
+        )
+    })
+}
+
+/// A write whose caller is dropped while it waits for a
+/// `max_concurrent_writes` permit is in no detached stage: it is reported so,
+/// with nothing inserted, it never reports an end, and nothing is stored. A
+/// write whose caller got its result is never reported as dropped.
+#[cfg(target_family = "unix")]
+#[nativelink_test]
+async fn write_dropped_before_its_write_permit_reports_no_detached_stage() -> Result<(), Error> {
+    static GATE: RenameGate = RenameGate::new(GatedRenames::ContentPublishes, 0, 0, 1);
+    fn rename_fn(from: &OsStr, to: &OsStr) -> Result<(), std::io::Error> {
+        GATE.rename(from, to)
+    }
+    let _release = ReleaseAllOnDrop(&GATE);
+    let store = FilesystemStore::<FileEntryImpl>::new_with_timeout_and_rename_fn(
+        &FilesystemSpec {
+            content_path: make_temp_path("content_path"),
+            temp_path: make_temp_path("temp_path"),
+            max_concurrent_writes: 1,
+            ..Default::default()
+        },
+        rename_fn,
+    )
+    .await?;
+    let held = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let dropped = DigestInfo::try_new(HASH2, VALUE2.len())?;
+    let held_key = StoreKey::Digest(held).as_str().into_owned();
+    let dropped_key = StoreKey::Digest(dropped).as_str().into_owned();
+    let logs = |check: &dyn Fn(&[&str]) -> Result<(), String>| logs_assert(check);
+
+    // The held write keeps the only write permit inside its rename.
+    let holder = background_spawn!("held_write", {
+        let store = store.clone();
+        async move { store.update_oneshot(held, VALUE1.into()).await }
+    });
+    GATE.wait_entered(1).await?;
+    let waiter = background_spawn!("write_permit_waiter", {
+        let store = store.clone();
+        async move { store.update_oneshot(dropped, VALUE2.into()).await }
+    });
+    wait_for_log_lines(logs, &format!("key={dropped_key} phase=write_permit"), 1).await?;
+
+    waiter.abort();
+    assert!(waiter.await.is_err_and(|err| err.is_cancelled()));
+    assert_eq!(
+        count_log_lines(
+            logs,
+            &format!(
+                "Caller stopped waiting for a filesystem store write key={dropped_key} \
+                 phase=write_permit detached_stage=false inserted=false"
+            )
+        ),
+        1
+    );
+
+    GATE.release(1);
+    join_bounded(holder).await?;
+    assert_eq!(
+        store.has(dropped).await?,
+        None,
+        "the dropped write stored nothing"
+    );
+    assert_eq!(
+        count_log_lines(
+            logs,
+            &format!("ended after its caller stopped waiting key={dropped_key}")
+        ),
+        0,
+        "a write that started no detached work never ends on its own"
+    );
+    assert_eq!(
+        count_log_lines(
+            logs,
+            &format!("Caller stopped waiting for a filesystem store write key={held_key}")
+        ),
+        0,
+        "the held write's caller got its result"
+    );
+    Ok(())
+}
+
+/// A write whose caller is dropped while its detached finalizer is renaming
+/// the file goes on: it is reported as in a detached stage with nothing
+/// inserted yet, and once the rename ends it reports that it inserted its
+/// file, which is then stored.
+#[cfg(target_family = "unix")]
+#[nativelink_test]
+async fn write_dropped_during_publication_reports_its_detached_end() -> Result<(), Error> {
+    static GATE: RenameGate = RenameGate::new(GatedRenames::ContentPublishes, 0, 0, 1);
+    fn rename_fn(from: &OsStr, to: &OsStr) -> Result<(), std::io::Error> {
+        GATE.rename(from, to)
+    }
+    let _release = ReleaseAllOnDrop(&GATE);
+    let store = FilesystemStore::<FileEntryImpl>::new_with_timeout_and_rename_fn(
+        &FilesystemSpec {
+            content_path: make_temp_path("content_path"),
+            temp_path: make_temp_path("temp_path"),
+            ..Default::default()
+        },
+        rename_fn,
+    )
+    .await?;
+    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let key = StoreKey::Digest(digest).as_str().into_owned();
+    let logs = |check: &dyn Fn(&[&str]) -> Result<(), String>| logs_assert(check);
+
+    let writer = background_spawn!("publishing_write", {
+        let store = store.clone();
+        async move { store.update_oneshot(digest, VALUE1.into()).await }
+    });
+    GATE.wait_entered(1).await?;
+    writer.abort();
+    assert!(writer.await.is_err_and(|err| err.is_cancelled()));
+    assert_eq!(
+        count_log_lines(
+            logs,
+            &format!(
+                "Caller stopped waiting for a filesystem store write key={key} \
+                 phase=publish detached_stage=true inserted=false"
+            )
+        ),
+        1
+    );
+    let ended = format!("Filesystem store write ended after its caller stopped waiting key={key}");
+    assert_eq!(count_log_lines(logs, &ended), 0, "the rename is still held");
+
+    GATE.release(1);
+    wait_for_log_lines(logs, &ended, 1).await?;
+    logs_assert(|lines: &[&str]| {
+        let line = lines.iter().find(|line| line.contains(&ended)).unwrap();
+        if line.contains("inserted=true outcome=inserted") {
+            Ok(())
+        } else {
+            Err(format!("unexpected end: {line}"))
+        }
+    });
+    assert_eq!(
+        store.get_part_unchunked(digest, 0, None).await?,
+        VALUE1.as_bytes()
+    );
+    Ok(())
+}
+
+/// A write whose caller is dropped after its publication inserted its file,
+/// while it retires the generation it displaced, is reported as in a
+/// detached stage with its file inserted: its blob is already readable. It
+/// reports its end once retirement is admitted.
+#[cfg(target_family = "unix")]
+#[nativelink_test]
+async fn write_dropped_during_retirement_is_reported_as_inserted() -> Result<(), Error> {
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: make_temp_path("content_path"),
+        temp_path: make_temp_path("temp_path"),
+        ..Default::default()
+    })
+    .await?;
+    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let key = StoreKey::Digest(digest).as_str().into_owned();
+    let logs = |check: &dyn Fn(&[&str]) -> Result<(), String>| logs_assert(check);
+    let retiring = format!("key={key} phase=retire");
+
+    // The first generation; publishing it displaces nothing.
+    store.update_oneshot(digest, VALUE1.into()).await?;
+    assert_eq!(count_log_lines(logs, &retiring), 1);
+
+    // Different content of the same size is no duplicate, so its publication
+    // displaces the first generation, whose retirement then waits here.
+    let admission = store.hold_retirement_admission_for_test().await;
+    let writer = background_spawn!("displacing_write", {
+        let store = store.clone();
+        async move { store.update_oneshot(digest, VALUE2.into()).await }
+    });
+    wait_for_log_lines(logs, &retiring, 2).await?;
+    writer.abort();
+    assert!(writer.await.is_err_and(|err| err.is_cancelled()));
+    assert_eq!(
+        count_log_lines(
+            logs,
+            &format!(
+                "Caller stopped waiting for a filesystem store write key={key} \
+                 phase=retire detached_stage=true inserted=true"
+            )
+        ),
+        1
+    );
+    assert_eq!(
+        store.get_part_unchunked(digest, 0, None).await?,
+        VALUE2.as_bytes(),
+        "the dropped write had already inserted its file"
+    );
+
+    let ended = format!("Filesystem store write ended after its caller stopped waiting key={key}");
+    assert_eq!(count_log_lines(logs, &ended), 0, "retirement is still held");
+    drop(admission);
+    wait_for_log_lines(logs, &ended, 1).await?;
+    logs_assert(|lines: &[&str]| {
+        let line = lines.iter().find(|line| line.contains(&ended)).unwrap();
+        if line.contains("inserted=true outcome=inserted") {
+            Ok(())
+        } else {
+            Err(format!("unexpected end: {line}"))
+        }
+    });
+    Ok(())
+}
+
+/// Polls `write`, a write's caller, until its duplicate check has started,
+/// and returns at once, before yielding: on this test's single-threaded
+/// runtime the check's own task cannot have run yet. Only this test polls the
+/// caller; the duplicate check runs in its own task.
+#[cfg(target_family = "unix")]
+async fn poll_until_duplicate_check_starts(
+    logs_assert: impl Fn(&dyn Fn(&[&str]) -> Result<(), String>) + Copy + Send + Sync,
+    key: &str,
+    write: &mut core::pin::Pin<Box<impl Future<Output = Result<(), Error>> + Send>>,
+) -> Result<(), Error> {
+    let started = format!("key={key} phase=duplicate_check write_id");
+    tokio::time::timeout(TASK_JOIN_LIMIT, async {
+        loop {
+            assert!(
+                poll!(write.as_mut()).is_pending(),
+                "the write returned before its duplicate check started"
+            );
+            if count_log_lines(logs_assert, &started) != 0 {
+                return;
+            }
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .map_err(|_| make_err!(Code::DeadlineExceeded, "the duplicate check never started"))
+}
+
+/// A caller dropped after its write's duplicate check has finished, but
+/// before the caller took up the answer, still gets the write an end: the
+/// caller-drop report carries it, and nothing was inserted.
+#[cfg(target_family = "unix")]
+#[nativelink_test]
+async fn write_dropped_with_an_untaken_duplicate_check_answer_reports_its_end() -> Result<(), Error>
+{
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: make_temp_path("content_path"),
+        temp_path: make_temp_path("temp_path"),
+        ..Default::default()
+    })
+    .await?;
+    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let key = StoreKey::Digest(digest).as_str().into_owned();
+    let logs = |check: &dyn Fn(&[&str]) -> Result<(), String>| logs_assert(check);
+
+    let mut write = Box::pin(store.update_oneshot(digest, VALUE1.into()));
+    poll_until_duplicate_check_starts(logs, &key, &mut write).await?;
+    // The check finishes in its own task while the caller is not polled.
+    wait_for_log_lines(
+        logs,
+        &format!("key={key} phase=duplicate_checked write_id"),
+        1,
+    )
+    .await?;
+    drop(write);
+
+    assert_eq!(
+        count_log_lines(
+            logs,
+            &format!(
+                "Caller stopped waiting for a filesystem store write key={key} \
+                 phase=duplicate_checked detached_stage=false inserted=false"
+            )
+        ),
+        1
+    );
+    assert_eq!(
+        count_log_lines(
+            logs,
+            "outcome=Some(\"not inserted: its caller stopped waiting in duplicate_checked\")"
+        ),
+        1,
+        "the caller-drop report must carry the write's end"
+    );
+    assert_eq!(store.has(digest).await?, None, "nothing was inserted");
+    Ok(())
+}
+
+/// A caller dropped while its write's duplicate check is still running: the
+/// check goes on in its own task, and when it finishes it ends the write,
+/// as nobody will take up its answer.
+#[cfg(target_family = "unix")]
+#[nativelink_test]
+async fn write_dropped_during_its_duplicate_check_reports_the_checks_end() -> Result<(), Error> {
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: make_temp_path("content_path"),
+        temp_path: make_temp_path("temp_path"),
+        ..Default::default()
+    })
+    .await?;
+    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let key = StoreKey::Digest(digest).as_str().into_owned();
+    let logs = |check: &dyn Fn(&[&str]) -> Result<(), String>| logs_assert(check);
+
+    let mut write = Box::pin(store.update_oneshot(digest, VALUE1.into()));
+    poll_until_duplicate_check_starts(logs, &key, &mut write).await?;
+    assert_eq!(
+        count_log_lines(logs, &format!("key={key} phase=duplicate_checked write_id")),
+        0,
+        "the check must still be running when the caller is dropped"
+    );
+    drop(write);
+    assert_eq!(
+        count_log_lines(
+            logs,
+            &format!(
+                "Caller stopped waiting for a filesystem store write key={key} \
+                 phase=duplicate_check detached_stage=true inserted=false"
+            )
+        ),
+        1
+    );
+
+    let ended = format!("Filesystem store write ended after its caller stopped waiting key={key}");
+    wait_for_log_lines(logs, &ended, 1).await?;
+    assert_eq!(
+        count_log_lines(
+            logs,
+            "outcome=not inserted: no caller took up the duplicate check"
+        ),
+        1
+    );
+    assert_eq!(store.has(digest).await?, None, "nothing was inserted");
+    Ok(())
+}
