@@ -863,7 +863,7 @@ impl<Fe: FileEntry> RetirementDrain<Fe> {
                     None => unreachable!("a unit was just taken"),
                 };
                 tokio::pin!(unit);
-                let completed_unref = loop {
+                loop {
                     let next_report =
                         tokio::time::Instant::from_std(last_report + self.queue.report_every());
                     tokio::select! {
@@ -879,8 +879,7 @@ impl<Fe: FileEntry> RetirementDrain<Fe> {
                             );
                         }
                     }
-                };
-                completed_unref
+                }
             };
             let unit = self.current.take();
             if let (Some(RetirementUnit::Unref(entry)), Some(unrefed)) = (unit, completed_unref) {
