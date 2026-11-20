@@ -253,7 +253,9 @@ async fn a_long_drain_reports_its_backlog() -> Result<(), Error> {
         if backlog && caught_up {
             Ok(())
         } else {
-            Err(format!("backlog report {backlog}, caught-up report {caught_up}"))
+            Err(format!(
+                "backlog report {backlog}, caught-up report {caught_up}"
+            ))
         }
     });
     Ok(())

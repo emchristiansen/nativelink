@@ -911,7 +911,7 @@ pub fn to_execute_response(action_result: ActionResult) -> ExecuteResponse {
         let mut logs = HashMap::with_capacity(server_logs.len());
         for (k, v) in server_logs {
             logs.insert(
-                k.clone(),
+                k,
                 LogFile {
                     digest: Some(v.into()),
                     human_readable: false,
