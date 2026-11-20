@@ -1868,6 +1868,389 @@ async fn executable_hardlink_source_created_once_and_readonly() -> Result<(), Er
     Ok(())
 }
 
+/// Scripted stand-in for `rename(2)` that lets a test hold or fail the renames
+/// publishing executable variants, in order. Every other rename (ordinary CAS
+/// publishes) passes straight through. Each test owns its own `static` gate,
+/// because a store takes its rename hook as a plain `fn` pointer.
+///
+/// Only the writers a test expects can be held. A rename beyond that count is
+/// an extra writer: it fails at once instead of waiting, so a defect that adds
+/// a writer — however late it arrives — ends the test with a failure rather
+/// than leaving it awaiting a writer that no release will ever reach.
+#[cfg(target_family = "unix")]
+#[derive(Debug)]
+struct ExecutableRenameGate {
+    state: std::sync::Mutex<ExecutableRenameState>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(target_family = "unix")]
+#[derive(Debug)]
+struct ExecutableRenameState {
+    /// Executable renames that have started.
+    entered: u32,
+    /// Executable rename `i` proceeds only once `i < released`.
+    released: u32,
+    /// Bit `i` makes executable rename `i` fail instead of renaming.
+    fail_mask: u32,
+    /// Executable renames the test expects; rename `i >= expected` is an
+    /// extra writer and fails immediately without waiting.
+    expected: u32,
+}
+
+#[cfg(target_family = "unix")]
+impl ExecutableRenameGate {
+    const fn new(released: u32, fail_mask: u32, expected: u32) -> Self {
+        Self {
+            state: std::sync::Mutex::new(ExecutableRenameState {
+                entered: 0,
+                released,
+                fail_mask,
+                expected,
+            }),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn rename(&self, from: &OsStr, to: &OsStr) -> Result<(), std::io::Error> {
+        if !to.to_string_lossy().contains(".exec/") {
+            return std::fs::rename(from, to);
+        }
+        let mut state = self.state.lock().unwrap();
+        let index = state.entered;
+        state.entered += 1;
+        self.changed.notify_all();
+        if index >= state.expected {
+            return Err(std::io::Error::other(format!(
+                "unexpected extra executable writer (rename {index})"
+            )));
+        }
+        while index >= state.released {
+            state = self.changed.wait(state).unwrap();
+        }
+        let fail = state.fail_mask & (1 << index) != 0;
+        drop(state);
+        if fail {
+            return Err(std::io::Error::other("executable publish blocked by test"));
+        }
+        std::fs::rename(from, to)
+    }
+
+    fn entered(&self) -> u32 {
+        self.state.lock().unwrap().entered
+    }
+
+    fn release(&self, released: u32) {
+        self.state.lock().unwrap().released = released;
+        self.changed.notify_all();
+    }
+
+    /// Waits, without blocking the test runtime, until `count` executable
+    /// renames have started.
+    async fn wait_entered(&self, count: u32) -> Result<(), Error> {
+        for _ in 0..10_000 {
+            if self.entered() >= count {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(1)).await;
+        }
+        Err(make_err!(
+            Code::DeadlineExceeded,
+            "Only {} of {count} executable renames started",
+            self.entered()
+        ))
+    }
+}
+
+/// Releases every held rename when dropped, so a failing assertion cannot
+/// strand a blocking-pool thread (and hang runtime shutdown) inside the gate.
+#[cfg(target_family = "unix")]
+#[derive(Debug)]
+struct ReleaseAllOnDrop(&'static ExecutableRenameGate);
+
+#[cfg(target_family = "unix")]
+impl Drop for ReleaseAllOnDrop {
+    fn drop(&mut self) {
+        self.0.release(u32::MAX);
+    }
+}
+
+/// How long a test waits for a task it owns before failing instead.
+#[cfg(target_family = "unix")]
+const TASK_JOIN_LIMIT: Duration = Duration::from_mins(1);
+
+/// Joins a test-owned task, failing instead of waiting forever if it never
+/// finishes. The gate already rules out a hang inside it; this bounds the
+/// test against any other.
+#[cfg(target_family = "unix")]
+async fn join_bounded<T>(task: tokio::task::JoinHandle<T>) -> T {
+    tokio::time::timeout(TASK_JOIN_LIMIT, task)
+        .await
+        .expect("test-owned task did not finish within TASK_JOIN_LIMIT")
+        .expect("test-owned task panicked")
+}
+
+/// Names in the executable-variant directory: published variants and any
+/// temporary file a materialization left behind.
+#[cfg(target_family = "unix")]
+fn executable_dir_entries(content_path: &str) -> Result<Vec<String>, Error> {
+    let mut names = std::fs::read_dir(format!("{content_path}.exec/{DIGEST_FOLDER_V2}"))?
+        .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<Vec<_>, std::io::Error>>()?;
+    names.sort();
+    Ok(names)
+}
+
+/// The variant this process may hardlink must have no open writer anywhere in
+/// the process: an inherited writable fd is what turns a later `execve` into
+/// `ETXTBSY`.
+#[cfg(target_os = "linux")]
+fn assert_no_open_fd_for(path: &OsStr) -> Result<(), Error> {
+    let target = std::fs::canonicalize(path)?;
+    for entry in std::fs::read_dir("/proc/self/fd")? {
+        if let Ok(link) = std::fs::read_link(entry?.path()) {
+            assert_ne!(link, target, "published executable variant has an open fd");
+        }
+    }
+    Ok(())
+}
+
+/// A failed attempt to publish an executable variant must not poison its
+/// digest. The attempt copies the read-only (0o444) CAS blob to a temporary
+/// file, makes it 0o555 and renames it into place; when the rename fails, the
+/// next attempt for the same digest must still build and publish the variant,
+/// and nothing from the failed attempt may remain. Before the fix the failed
+/// attempt left its fixed `.tmp` path behind read-only, so every retry's copy
+/// into it failed with `EACCES` for as long as that leftover persisted.
+#[cfg(target_family = "unix")]
+#[nativelink_test]
+async fn executable_variant_retry_succeeds_after_failed_publish() -> Result<(), Error> {
+    use std::os::unix::fs::MetadataExt;
+
+    static GATE: ExecutableRenameGate = ExecutableRenameGate::new(u32::MAX, 0b1, 2);
+    fn rename_fn(from: &OsStr, to: &OsStr) -> Result<(), std::io::Error> {
+        GATE.rename(from, to)
+    }
+    const SCRIPT: &str = "#!/bin/sh\necho executable-variant-ran\n";
+    let _release = ReleaseAllOnDrop(&GATE);
+
+    let content_path = make_temp_path("content_path");
+    let digest = DigestInfo::try_new(HASH1, SCRIPT.len())?;
+    let store = FilesystemStore::<FileEntryImpl>::new_with_timeout_and_rename_fn(
+        &FilesystemSpec {
+            content_path: content_path.clone(),
+            temp_path: make_temp_path("temp_path"),
+            ..Default::default()
+        },
+        rename_fn,
+    )
+    .await?;
+    store.update_oneshot(digest, SCRIPT.into()).await?;
+    let blob_path = content_file_path(&content_path, &StoreKey::Digest(digest)).await?;
+    let blob_meta = fs::metadata(&blob_path).await?;
+    assert_eq!(blob_meta.mode() & 0o777, 0o444);
+
+    // The worker resolves executable inputs through the batch entry point.
+    let mut first = store.get_executable_hardlink_sources(&[digest]).await;
+    let first_err = first.pop().unwrap().expect_err("injected rename failure");
+    assert!(
+        format!("{first_err:?}").contains("executable-variant rename failed"),
+        "unexpected first error: {first_err:?}"
+    );
+    assert_eq!(GATE.entered(), 1);
+
+    let retry = store
+        .get_executable_hardlink_sources(&[digest])
+        .await
+        .pop()
+        .unwrap()
+        .err_tip(|| "Retrying the executable variant after a failed publish")?;
+    assert_eq!(GATE.entered(), 2, "the retry must publish exactly once");
+
+    let variant_meta = fs::metadata(&retry).await?;
+    assert_eq!(variant_meta.mode() & 0o777, 0o555);
+    assert_ne!(variant_meta.ino(), blob_meta.ino());
+    assert_eq!(read_file_contents(&retry).await?, SCRIPT.as_bytes());
+    assert_eq!(
+        executable_dir_entries(&content_path)?,
+        vec![digest.to_string()],
+        "only the published variant may remain; temporary files must be removed"
+    );
+    #[cfg(target_os = "linux")]
+    assert_no_open_fd_for(&retry)?;
+    // The published variant runs: no writer holds it (`ETXTBSY`) and it is
+    // executable (`EACCES`).
+    let ran = std::process::Command::new(&retry).output()?;
+    assert!(ran.status.success(), "variant failed to run: {ran:?}");
+    assert_eq!(ran.stdout, b"executable-variant-ran\n");
+
+    // Warm reuse: the same inode, with no further materialization.
+    let warm = store.get_executable_hardlink_source(&digest).await?;
+    assert_eq!(warm, retry);
+    assert_eq!(fs::metadata(&warm).await?.ino(), variant_meta.ino());
+    assert_eq!(GATE.entered(), 2);
+
+    // The shared CAS blob is untouched throughout.
+    let blob_meta_after = fs::metadata(&blob_path).await?;
+    assert_eq!(blob_meta_after.mode() & 0o777, 0o444);
+    assert_eq!(blob_meta_after.ino(), blob_meta.ino());
+    assert_eq!(read_file_contents(&blob_path).await?, SCRIPT.as_bytes());
+    Ok(())
+}
+
+/// Cancelling a caller must not let a second writer start while the first
+/// materialization is still running. The copy runs on a blocking thread that
+/// outlives a cancelled caller, so that thread, not the caller, must keep the
+/// digest's single-flight lock until it has finished. A later caller then
+/// waits and reuses the published variant rather than copying again.
+#[cfg(target_family = "unix")]
+#[nativelink_test]
+async fn cancelled_executable_variant_caller_keeps_single_writer() -> Result<(), Error> {
+    static GATE: ExecutableRenameGate = ExecutableRenameGate::new(0, 0, 1);
+    fn rename_fn(from: &OsStr, to: &OsStr) -> Result<(), std::io::Error> {
+        GATE.rename(from, to)
+    }
+    let _release = ReleaseAllOnDrop(&GATE);
+
+    let content_path = make_temp_path("content_path");
+    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let store = FilesystemStore::<FileEntryImpl>::new_with_timeout_and_rename_fn(
+        &FilesystemSpec {
+            content_path: content_path.clone(),
+            temp_path: make_temp_path("temp_path"),
+            ..Default::default()
+        },
+        rename_fn,
+    )
+    .await?;
+    store.update_oneshot(digest, VALUE1.into()).await?;
+
+    // The first caller copies and chmods, then holds in the rename; cancel it
+    // there. Awaiting the aborted task proves its future has been dropped.
+    let first = background_spawn!("cancelled_variant_first", {
+        let store = store.clone();
+        async move { store.get_executable_hardlink_source(&digest).await }
+    });
+    GATE.wait_entered(1).await?;
+    first.abort();
+    let cancelled = tokio::time::timeout(TASK_JOIN_LIMIT, first)
+        .await
+        .expect("cancelled task did not finish within TASK_JOIN_LIMIT");
+    assert!(cancelled.is_err_and(|e| e.is_cancelled()));
+
+    // While the cancelled caller's copy is unfinished, a new caller must wait
+    // for it instead of starting a second writer.
+    let mut second = background_spawn!("cancelled_variant_second", {
+        let store = store.clone();
+        async move { store.get_executable_hardlink_source(&digest).await }
+    });
+    if let Ok(early) = tokio::time::timeout(Duration::from_secs(2), &mut second).await {
+        panic!("second caller finished while the first writer was unfinished: {early:?}");
+    }
+    // Witness that the waiting caller did not write either: a second writer
+    // would by now have copied and reached its own (held) rename.
+    assert_eq!(
+        GATE.entered(),
+        1,
+        "a second writer started while the first was unfinished"
+    );
+    GATE.release(1);
+    let variant = join_bounded(second).await?;
+    assert_eq!(
+        GATE.entered(),
+        1,
+        "exactly one writer may materialize the variant"
+    );
+    assert_eq!(read_file_contents(&variant).await?, VALUE1.as_bytes());
+    assert_eq!(
+        executable_dir_entries(&content_path)?,
+        vec![digest.to_string()]
+    );
+    Ok(())
+}
+
+/// After a failed materialization, callers that were already waiting on the
+/// failed attempt's lock and callers arriving afresh must still serialize on
+/// one lock. Before the fix the failed attempt removed the lock entry while
+/// old waiters held it, so a newcomer created a second lock and wrote
+/// alongside an old waiter.
+#[cfg(target_family = "unix")]
+#[nativelink_test]
+async fn executable_variant_waiters_and_newcomers_share_one_writer() -> Result<(), Error> {
+    static GATE: ExecutableRenameGate = ExecutableRenameGate::new(0, 0b1, 2);
+    fn rename_fn(from: &OsStr, to: &OsStr) -> Result<(), std::io::Error> {
+        GATE.rename(from, to)
+    }
+    let _release = ReleaseAllOnDrop(&GATE);
+
+    let content_path = make_temp_path("content_path");
+    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let store = FilesystemStore::<FileEntryImpl>::new_with_timeout_and_rename_fn(
+        &FilesystemSpec {
+            content_path: content_path.clone(),
+            temp_path: make_temp_path("temp_path"),
+            ..Default::default()
+        },
+        rename_fn,
+    )
+    .await?;
+    store.update_oneshot(digest, VALUE1.into()).await?;
+    let spawn_lookup = || {
+        let store = store.clone();
+        background_spawn!("variant_lookup", async move {
+            store.get_executable_hardlink_source(&digest).await
+        })
+    };
+
+    // The first writer holds in its rename while two more callers queue on
+    // its lock; then its rename fails.
+    let failing = spawn_lookup();
+    GATE.wait_entered(1).await?;
+    let waiters = [spawn_lookup(), spawn_lookup()];
+    // Give both callers time to pass the fast-path check and queue on the
+    // writer's lock. Nothing observable marks that, so this settles rather
+    // than proves it; the test passes whichever way they arrive, and a
+    // mutation run that restores the old lock removal shows it discriminates.
+    sleep(Duration::from_millis(500)).await;
+    GATE.release(1);
+    let failed = join_bounded(failing)
+        .await
+        .expect_err("injected rename failure");
+    assert!(format!("{failed:?}").contains("executable-variant rename failed"));
+
+    // One old waiter takes over and holds in its own rename. A newcomer must
+    // queue behind it rather than start a second writer.
+    GATE.wait_entered(2).await?;
+    let mut newcomer = spawn_lookup();
+    if let Ok(early) = tokio::time::timeout(Duration::from_secs(2), &mut newcomer).await {
+        panic!("newcomer finished while an old waiter was writing: {early:?}");
+    }
+    // Witness that nobody else wrote alongside the old waiter: another writer
+    // would by now have reached its own (held) rename.
+    assert_eq!(
+        GATE.entered(),
+        2,
+        "a second writer started alongside the old waiter"
+    );
+    GATE.release(2);
+
+    let variant = join_bounded(newcomer).await?;
+    for waiter in waiters {
+        assert_eq!(join_bounded(waiter).await?, variant);
+    }
+    assert_eq!(
+        GATE.entered(),
+        2,
+        "one failed and one successful writer only"
+    );
+    assert_eq!(read_file_contents(&variant).await?, VALUE1.as_bytes());
+    assert_eq!(
+        executable_dir_entries(&content_path)?,
+        vec![digest.to_string()]
+    );
+    Ok(())
+}
+
 /// A store whose `.exec` directory cannot be cleared must still start and
 /// serve ordinary CAS reads. It must not, however, trust an executable variant
 /// left behind by an earlier process: that file may be stale or torn after an

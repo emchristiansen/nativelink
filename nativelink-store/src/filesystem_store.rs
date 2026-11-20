@@ -24,9 +24,9 @@ use std::ffi::{OsStr, OsString};
 use std::sync::{Arc, Weak};
 use std::time::SystemTime;
 
-#[cfg(unix)]
-use async_lock::Mutex;
 use async_lock::RwLock;
+#[cfg(unix)]
+use async_lock::{Mutex, MutexGuardArc};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::stream::{StreamExt, TryStreamExt};
@@ -1360,15 +1360,154 @@ pub struct FilesystemStore<Fe: FileEntry = FileEntryImpl> {
     flush_coalescer: Option<Arc<FlushCoalescer>>,
     /// Per-digest single-flight locks guarding creation of the executable
     /// variant in `{content_path}.exec`, so each variant's writable fd is
-    /// opened exactly once. The outer lock is sync and only ever held to
-    /// get/insert/remove the per-digest async lock — never across I/O.
+    /// opened exactly once. See [`ExecutableVariantLease`].
     #[cfg(unix)]
-    executable_locks: std::sync::Mutex<HashMap<DigestInfo, Arc<Mutex<()>>>>,
+    executable_locks: Arc<ExecutableLocks>,
     /// False when the startup wipe could not safely remove old executable
     /// variants from a read-only filesystem. Ordinary CAS reads remain
     /// available, but executable hardlink sources must not reuse stale files.
     #[cfg(unix)]
     executable_variants_enabled: bool,
+}
+
+/// The per-digest executable-variant locks. The outer lock is sync and only
+/// ever held to get, insert, check or remove a per-digest entry — never across
+/// I/O.
+#[cfg(unix)]
+type ExecutableLocks = std::sync::Mutex<HashMap<DigestInfo, Arc<Mutex<()>>>>;
+
+/// Exclusive right to materialize one digest's executable variant.
+///
+/// A lease holds the digest's lock *and* that lock is still the digest's
+/// entry in [`ExecutableLocks`]. Only a lease removes the entry, when it is
+/// dropped and before it releases the lock, so the map stays bounded. A
+/// caller that waited on a lock whose lease has since retired it finds the
+/// entry gone or replaced and queues on the current lock instead. Holding a
+/// retired lock therefore never licenses a write: at most one writer per
+/// digest, including between an old waiter and a newcomer.
+///
+/// Every entry therefore belongs to a lease: whoever inserts an entry locks
+/// its fresh lock in the same poll, or else queues behind the caller that took
+/// it first, whose lease then retires the entry. Cancelling a queued caller
+/// only drops its claim on the lock.
+///
+/// The lease moves into the blocking task that does the copy. That task runs
+/// to completion even when its caller is cancelled, and the lease is released
+/// only when the task — the actual writer — has finished.
+#[cfg(unix)]
+struct ExecutableVariantLease {
+    locks: Arc<ExecutableLocks>,
+    digest: DigestInfo,
+    guard: MutexGuardArc<()>,
+}
+
+#[cfg(unix)]
+impl ExecutableVariantLease {
+    async fn acquire(locks: &Arc<ExecutableLocks>, digest: DigestInfo) -> Self {
+        loop {
+            let guard = locks
+                .lock()
+                .expect("executable_locks poisoned")
+                .entry(digest)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .lock_arc();
+            let guard = guard.await;
+            let current = locks
+                .lock()
+                .expect("executable_locks poisoned")
+                .get(&digest)
+                .is_some_and(|entry| Arc::ptr_eq(entry, MutexGuardArc::source(&guard)));
+            if current {
+                return Self {
+                    locks: locks.clone(),
+                    digest,
+                    guard,
+                };
+            }
+            // The lease we waited behind retired this lock; dropping `guard`
+            // lets its other waiters notice the same, and we queue on the
+            // digest's current lock.
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Debug for ExecutableVariantLease {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ExecutableVariantLease")
+            .field("digest", &self.digest)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ExecutableVariantLease {
+    fn drop(&mut self) {
+        let mut locks = self.locks.lock().expect("executable_locks poisoned");
+        if locks
+            .get(&self.digest)
+            .is_some_and(|entry| Arc::ptr_eq(entry, MutexGuardArc::source(&self.guard)))
+        {
+            locks.remove(&self.digest);
+        }
+        // `guard` is released after this, once the entry is gone.
+    }
+}
+
+/// The temporary file of one executable-variant materialization attempt.
+///
+/// Each attempt creates its own uniquely named file with `O_EXCL`, so no
+/// attempt ever opens a file another attempt created — in particular not one
+/// a failed attempt left behind read-only. Names are unique within the
+/// process; files from an earlier process are gone because executable
+/// variants are enabled only after the startup wipe clears the directory.
+/// Dropping it removes the file unless it was published by the rename.
+#[cfg(unix)]
+#[derive(Debug)]
+struct ExecutableVariantTemp {
+    path: OsString,
+    published: bool,
+}
+
+#[cfg(unix)]
+impl ExecutableVariantTemp {
+    fn create(variant_path: &OsStr) -> Result<(Self, std::fs::File), std::io::Error> {
+        use std::os::unix::fs::OpenOptionsExt;
+        static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(0);
+        let mut path = variant_path.to_os_string();
+        path.push(format!(
+            ".{}.tmp",
+            NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        Ok((
+            Self {
+                path,
+                published: false,
+            },
+            file,
+        ))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ExecutableVariantTemp {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        if let Err(err) = std::fs::remove_file(&self.path) {
+            warn!(
+                path = ?self.path,
+                ?err,
+                "Failed to remove an unpublished executable-variant temporary file"
+            );
+        }
+    }
 }
 
 impl<Fe: FileEntry> FilesystemStore<Fe> {
@@ -1498,7 +1637,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             #[cfg(target_os = "macos")]
             flush_coalescer,
             #[cfg(unix)]
-            executable_locks: std::sync::Mutex::new(HashMap::new()),
+            executable_locks: Arc::default(),
             #[cfg(unix)]
             executable_variants_enabled,
         }))
@@ -1677,25 +1816,16 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         // variant. Without this, a cold-cache burst of concurrent actions
         // would each open a writer for the same executable — the very window
         // ETXTBSY exploits.
-        let lock = {
-            let mut locks = self
-                .executable_locks
-                .lock()
-                .expect("executable_locks poisoned");
-            locks
-                .entry(*digest)
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        let _guard = lock.lock().await;
+        let lease = ExecutableVariantLease::acquire(&self.executable_locks, *digest).await;
 
         // Re-check: another task may have constructed it while we waited.
         if fs::metadata(&variant_path).await.is_ok() {
-            self.forget_executable_lock(digest);
             return Ok(variant_path);
         }
 
-        let result = self.create_executable_variant(digest, &variant_path).await;
+        let result = self
+            .create_executable_variant(digest, &variant_path, lease)
+            .await;
 
         // The digest may have been evicted mid-copy: its eviction callback ran
         // before the rename published the variant, so nothing owns the file
@@ -1714,9 +1844,6 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             );
         }
 
-        // Drop the per-digest lock entry regardless of outcome so the map
-        // cannot grow unbounded; a concurrent waiter already cloned the Arc.
-        self.forget_executable_lock(digest);
         result.map(|()| variant_path)
     }
 
@@ -1733,21 +1860,14 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             .await
     }
 
-    #[cfg(unix)]
-    fn forget_executable_lock(&self, digest: &DigestInfo) {
-        self.executable_locks
-            .lock()
-            .expect("executable_locks poisoned")
-            .remove(digest);
-    }
-
-    /// Materializes the 0o555 executable variant for `digest`. Must be called
-    /// under the per-digest single-flight guard.
+    /// Materializes the 0o555 executable variant for `digest`, under `lease`,
+    /// which the blocking copy holds until it has finished.
     #[cfg(unix)]
     async fn create_executable_variant(
         &self,
         digest: &DigestInfo,
         variant_path: &OsStr,
+        lease: ExecutableVariantLease,
     ) -> Result<(), Error> {
         // Resolve the on-disk CAS blob (0o444) to copy from. Must be present in
         // this tier; callers populate the fast store first.
@@ -1760,22 +1880,30 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             .await?;
 
         let variant_owned = variant_path.to_os_string();
-        let mut temp_owned = variant_path.to_os_string();
-        temp_owned.push(".tmp");
         let rename_fn = self.rename_fn;
 
         // All of this is blocking std::fs; run it off the async runtime. The
-        // writable fd opened by `copy` is fully closed before the `rename`
-        // publishes the inode, so no reachable hardlink of the variant ever has
-        // an open writer.
+        // writable fd is fully closed before the `rename` publishes the inode,
+        // so no reachable hardlink of the variant ever has an open writer.
+        // This task, not its possibly-cancelled caller, owns the lease and the
+        // temporary file: both are released when the copy has really ended.
         spawn_blocking!(
             "filesystem_store_executable_variant",
             move || -> Result<(), Error> {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::copy(&src_path, &temp_owned).map_err(|e| {
+                let _lease = lease;
+                let mut src = std::fs::File::open(&src_path).map_err(|e| {
                     make_err!(Code::Internal, "executable-variant copy failed: {e:?}")
                 })?;
-                std::fs::set_permissions(&temp_owned, std::fs::Permissions::from_mode(0o555))
+                let (mut temp, mut f) =
+                    ExecutableVariantTemp::create(&variant_owned).map_err(|e| {
+                        make_err!(Code::Internal, "executable-variant copy failed: {e:?}")
+                    })?;
+                std::io::copy(&mut src, &mut f).map_err(|e| {
+                    make_err!(Code::Internal, "executable-variant copy failed: {e:?}")
+                })?;
+                drop(src);
+                f.set_permissions(std::fs::Permissions::from_mode(0o555))
                     .map_err(|e| {
                         make_err!(
                             Code::Internal,
@@ -1791,8 +1919,6 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
                 // device, no multi-ms `F_FULLFSYNC` device-cache drain), which
                 // covers kernel panics — the next writable startup wipe covers
                 // power loss.
-                let f = std::fs::File::open(&temp_owned)
-                    .map_err(|e| make_err!(Code::Internal, "executable-variant reopen: {e:?}"))?;
                 #[cfg(target_os = "macos")]
                 let flush_result = {
                     use std::os::fd::AsRawFd;
@@ -1811,9 +1937,10 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
                 flush_result
                     .map_err(|e| make_err!(Code::Internal, "executable-variant fsync: {e:?}"))?;
                 drop(f);
-                rename_fn(temp_owned.as_os_str(), variant_owned.as_os_str()).map_err(|e| {
+                rename_fn(&temp.path, &variant_owned).map_err(|e| {
                     make_err!(Code::Internal, "executable-variant rename failed: {e:?}")
                 })?;
+                temp.published = true;
                 Ok(())
             }
         )
@@ -2411,5 +2538,86 @@ impl<Fe: FileEntry> HealthStatusIndicator for FilesystemStore<Fe> {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod executable_variant_lease_tests {
+    use core::pin::pin;
+    use std::sync::Arc;
+
+    use futures::executor::block_on;
+    use futures::poll;
+    use nativelink_util::common::DigestInfo;
+
+    use super::{ExecutableLocks, ExecutableVariantLease};
+
+    fn holders(locks: &ExecutableLocks, digest: &DigestInfo) -> Option<usize> {
+        locks
+            .lock()
+            .unwrap()
+            .get(digest)
+            .map(|lock| Arc::strong_count(lock) - 1)
+    }
+
+    /// Callers that queued on a lock which its lease then retired, and callers
+    /// arriving afterwards, must still get the digest's lease one at a time.
+    /// Polling by hand makes every interleaving point explicit: no timing.
+    #[test]
+    fn retired_lock_waiters_and_newcomers_take_turns() {
+        block_on(async {
+            let locks = Arc::<ExecutableLocks>::default();
+            let digest = DigestInfo::new([7; 32], 1);
+
+            let first = ExecutableVariantLease::acquire(&locks, digest).await;
+            let mut old_1 = pin!(ExecutableVariantLease::acquire(&locks, digest));
+            let mut old_2 = pin!(ExecutableVariantLease::acquire(&locks, digest));
+            assert!(poll!(&mut old_1).is_pending());
+            assert!(poll!(&mut old_2).is_pending());
+            // Both old waiters hold the first lock: it, plus two waiters.
+            assert_eq!(holders(&locks, &digest), Some(3));
+
+            // A waiter cancelled while queued leaves nothing behind: the entry
+            // stays owned by the lease it waited for, which retires it.
+            {
+                let mut cancelled = pin!(ExecutableVariantLease::acquire(&locks, digest));
+                assert!(poll!(&mut cancelled).is_pending());
+                assert_eq!(holders(&locks, &digest), Some(4));
+            }
+            assert_eq!(holders(&locks, &digest), Some(3));
+
+            // Retiring the lease removes its entry before releasing the lock.
+            drop(first);
+            assert_eq!(holders(&locks, &digest), None);
+
+            // A newcomer installs and takes a fresh lock. The old waiters may
+            // now take the retired lock, but must find it retired and queue on
+            // the newcomer's lock instead of proceeding.
+            let newcomer = ExecutableVariantLease::acquire(&locks, digest).await;
+            assert!(poll!(&mut old_1).is_pending());
+            assert!(poll!(&mut old_2).is_pending());
+            assert_eq!(holders(&locks, &digest), Some(3));
+
+            // Retiring the newcomer's lease lets exactly one old waiter in.
+            drop(newcomer);
+            let polled = (poll!(&mut old_1), poll!(&mut old_2));
+            let (winner, mut loser) = match polled {
+                (core::task::Poll::Ready(lease), core::task::Poll::Pending) => (lease, old_2),
+                (core::task::Poll::Pending, core::task::Poll::Ready(lease)) => (lease, old_1),
+                (one, two) => panic!(
+                    "exactly one old waiter must win: {:?} {:?}",
+                    one.is_ready(),
+                    two.is_ready()
+                ),
+            };
+            assert!(poll!(&mut loser).is_pending());
+            assert_eq!(holders(&locks, &digest), Some(2));
+
+            drop(winner);
+            let last = loser.await;
+            assert_eq!(holders(&locks, &digest), Some(1));
+            drop(last);
+            assert!(locks.lock().unwrap().is_empty(), "every lease retired");
+        });
     }
 }
