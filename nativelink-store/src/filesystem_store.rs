@@ -126,6 +126,53 @@ pub struct SharedContext {
     /// has succeeded and before its new path is recorded. See
     /// [`FilesystemStore::set_after_retire_rename_hook_for_test`].
     after_retire_rename: RetireRenameHook,
+    /// Retirement operations from their submission to the blocking pool to
+    /// the end of their closure. See [`SharedContext::retire_blocking`].
+    retirement_operations: Arc<BlockingOccupancy>,
+    /// Retired-file drains from their submission to the blocking pool to
+    /// their end. See [`SharedContext::retire_file`].
+    file_deletions: Arc<BlockingOccupancy>,
+}
+
+/// Counts the blocking-pool closures of one kind that have been submitted and
+/// have not ended, and the most there have been at once. Each such closure
+/// holds, or is queued for, a blocking-pool thread.
+#[derive(Debug, Default)]
+struct BlockingOccupancy {
+    running: AtomicU64,
+    peak: AtomicU64,
+}
+
+impl BlockingOccupancy {
+    fn enter(self: &Arc<Self>) -> OccupancyGuard {
+        let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(running, Ordering::SeqCst);
+        OccupancyGuard(self.clone())
+    }
+
+    fn peak(&self) -> u64 {
+        self.peak.load(Ordering::SeqCst)
+    }
+}
+
+/// One closure counted by a [`BlockingOccupancy`] until dropped.
+struct OccupancyGuard(Arc<BlockingOccupancy>);
+
+impl Drop for OccupancyGuard {
+    fn drop(&mut self) {
+        self.0.running.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Peak counts of a store's retirement closures on the blocking pool. See
+/// [`SharedContext::peak_blocking_retirement_for_test`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockingRetirementPeak {
+    /// Most retirement operations (renames, variant unlinks) submitted and
+    /// unfinished at once.
+    pub operations: u64,
+    /// Most retired-file drains submitted and unfinished at once.
+    pub file_deletions: u64,
 }
 
 type RetireRenameHookFn = Arc<dyn Fn() + Send + Sync>;
@@ -158,6 +205,17 @@ impl SharedContext {
             retired_files: parking_lot::Mutex::default(),
             retirement: Arc::new(Semaphore::new(1)),
             after_retire_rename: RetireRenameHook::default(),
+            retirement_operations: Arc::default(),
+            file_deletions: Arc::default(),
+        }
+    }
+
+    /// The most retirement closures of this store that have been on the
+    /// blocking pool at once: submitted, and not yet at their end.
+    pub fn peak_blocking_retirement_for_test(&self) -> BlockingRetirementPeak {
+        BlockingRetirementPeak {
+            operations: self.retirement_operations.peak(),
+            file_deletions: self.file_deletions.peak(),
         }
     }
 
@@ -211,8 +269,12 @@ impl SharedContext {
                 RetirementKind::Variant => "variant_queue",
             });
         }
+        let occupied = self.retirement_operations.enter();
         spawn_blocking!("filesystem_store_retire", move || {
+            // Dropped in reverse: the closure stops counting as occupied
+            // before its admission lets the next operation be submitted.
             let _admission = admission;
+            let _occupied = occupied;
             if let Some(trace) = &trace {
                 trace.retirement_detail(match kind {
                     RetirementKind::Rename => "rename_operation",
@@ -254,6 +316,7 @@ impl SharedContext {
         retired_files.draining = true;
         drop(retired_files);
         let drain = RetiredFileDrain {
+            occupied: Some(self.file_deletions.enter()),
             shared_context: self.clone(),
             finished: false,
         };
@@ -266,6 +329,9 @@ impl SharedContext {
 /// to the end, e.g. at runtime shutdown) lets the next retired file start a
 /// new drain, which also deletes the files this one left queued.
 struct RetiredFileDrain {
+    /// Released under the queue's lock just before `draining` is cleared, so
+    /// a successor drain is counted only after this one has stopped.
+    occupied: Option<OccupancyGuard>,
     shared_context: Arc<SharedContext>,
     finished: bool,
 }
@@ -276,6 +342,7 @@ impl RetiredFileDrain {
             let file_path = {
                 let mut retired_files = self.shared_context.retired_files.lock();
                 let Some(file_path) = retired_files.paths.pop_front() else {
+                    self.occupied = None;
                     retired_files.draining = false;
                     self.finished = true;
                     return;
@@ -313,7 +380,9 @@ impl RetiredFileDrain {
 impl Drop for RetiredFileDrain {
     fn drop(&mut self) {
         if !self.finished {
-            self.shared_context.retired_files.lock().draining = false;
+            let mut retired_files = self.shared_context.retired_files.lock();
+            self.occupied = None;
+            retired_files.draining = false;
         }
     }
 }
@@ -3046,6 +3115,11 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     /// out of the map.
     pub fn detach_unref_for_test(&self, entry: Arc<Fe>) {
         self.retirement.detach_unref(entry);
+    }
+
+    /// See [`SharedContext::peak_blocking_retirement_for_test`].
+    pub fn peak_blocking_retirement_for_test(&self) -> BlockingRetirementPeak {
+        self.shared_context.peak_blocking_retirement_for_test()
     }
 
     /// Sets how long a retirement drain runs between backlog reports (see

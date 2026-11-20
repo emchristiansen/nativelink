@@ -31,9 +31,9 @@ use nativelink_config::stores::{EvictionPolicy, FilesystemSpec};
 use nativelink_error::{Code, Error, ErrorContext, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_store::filesystem_store::{
-    DIGEST_FOLDER_V1, DIGEST_FOLDER_V2, EncodedFilePath, FileEntry, FileEntryImpl, FileType,
-    FilesystemStore, Generation, STR_FOLDER_V1, STR_FOLDER_V2, check_duplicate_files,
-    key_and_generation_from_file_v2, make_temp_key,
+    BlockingRetirementPeak, DIGEST_FOLDER_V1, DIGEST_FOLDER_V2, EncodedFilePath, FileEntry,
+    FileEntryImpl, FileType, FilesystemStore, Generation, STR_FOLDER_V1, STR_FOLDER_V2,
+    check_duplicate_files, key_and_generation_from_file_v2, make_temp_key,
 };
 use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::common::{DigestInfo, fs, make_temp_path};
@@ -5024,6 +5024,12 @@ fn retirement_after_a_lost_drain_deletes_the_files_it_left() -> Result<(), Error
 /// unlink) at a time, plus its one drain deleting retired files: the kernel
 /// performs those renames one at a time per filesystem, so more operations
 /// in flight only hold more blocking-pool threads.
+///
+/// The bound is measured as the store's closures on the blocking pool at
+/// once, from submission to the end of the closure, not as threads the
+/// runtime started: a closure that has just finished can still be on its
+/// way to the idle list when its successor is submitted, so the pool may
+/// start a thread without any more closures occupying threads at once.
 #[test]
 fn overlapping_retirements_hold_at_most_two_blocking_threads() -> Result<(), Error> {
     static BLOCKING_THREADS_STARTED: AtomicU64 = AtomicU64::new(0);
@@ -5074,7 +5080,6 @@ fn check_overlapping_retirements(
         }
         let evicting_map = store.get_evicting_map();
 
-        let started_before = blocking_threads_started.load(Ordering::SeqCst);
         let removed =
             futures::future::join_all(keys.iter().map(|key| evicting_map.remove(key))).await;
         assert!(removed.iter().all(|removed| *removed));
@@ -5089,10 +5094,16 @@ fn check_overlapping_retirements(
         })
         .await
         .map_err(|_| make_err!(Code::DeadlineExceeded, "retired files were not deleted"))??;
-        let started = blocking_threads_started.load(Ordering::SeqCst) - started_before;
-        assert!(
-            started <= 2,
-            "{RETIRING_ENTRIES} overlapping retirements started {started} blocking threads",
+        let peak = store.peak_blocking_retirement_for_test();
+        assert_eq!(
+            peak,
+            BlockingRetirementPeak {
+                operations: 1,
+                file_deletions: 1,
+            },
+            "{RETIRING_ENTRIES} overlapping retirements occupied more than one \
+             blocking-pool closure of a kind at once (threads started: {})",
+            blocking_threads_started.load(Ordering::SeqCst),
         );
         for key in &keys {
             assert!(!content_file_exists(&content_path, key).await?);
