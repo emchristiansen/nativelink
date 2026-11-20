@@ -95,6 +95,12 @@ pub enum FileType {
     String,
 }
 
+#[derive(Clone, Copy)]
+enum RetirementKind {
+    Rename,
+    Variant,
+}
+
 #[derive(Debug, MetricsComponent)]
 pub struct SharedContext {
     // Used in testing to know how many active drop() spawns are running.
@@ -155,17 +161,44 @@ impl SharedContext {
     /// retirement of the store behind the writers whose files it retires.
     async fn retire_blocking<T: Send + 'static>(
         &self,
+        kind: RetirementKind,
         operation: impl FnOnce() -> T + Send + 'static,
     ) -> Result<T, Error> {
+        let trace = RETIRE_TRACE.try_with(Arc::clone).ok();
+        if let Some(trace) = &trace {
+            trace.retirement_detail(match kind {
+                RetirementKind::Rename => "rename_admission",
+                RetirementKind::Variant => "variant_admission",
+            });
+        }
         let admission = self
             .retirement
             .clone()
             .acquire_owned()
             .await
             .map_err(|err| Error::from_std_err(Code::Internal, &err))?;
+        if let Some(trace) = &trace {
+            trace.retirement_detail(match kind {
+                RetirementKind::Rename => "rename_queue",
+                RetirementKind::Variant => "variant_queue",
+            });
+        }
         spawn_blocking!("filesystem_store_retire", move || {
             let _admission = admission;
-            operation()
+            if let Some(trace) = &trace {
+                trace.retirement_detail(match kind {
+                    RetirementKind::Rename => "rename_operation",
+                    RetirementKind::Variant => "variant_operation",
+                });
+            }
+            let result = operation();
+            if let Some(trace) = &trace {
+                trace.retirement_detail(match kind {
+                    RetirementKind::Rename => "rename_completion_handoff",
+                    RetirementKind::Variant => "variant_completion_handoff",
+                });
+            }
+            result
         })
         .await
         .map_err(Error::from)
@@ -875,6 +908,7 @@ impl LenEntry for FileEntryImpl {
     // target file location to the new temp file. `unref()` should only ever be called once.
     #[inline]
     async fn unref(&self) {
+        retirement_detail("entry_path_lock");
         let mut encoded_file_path = self.encoded_file_path.write().await;
         if encoded_file_path.path_type == PathType::Temp {
             // We are already a temp file that is now marked for deletion on drop.
@@ -899,7 +933,7 @@ impl LenEntry for FileEntryImpl {
 
         let renamed = encoded_file_path
             .shared_context
-            .retire_blocking({
+            .retire_blocking(RetirementKind::Rename, {
                 let (from_path, to_path) = (from_path.to_os_string(), to_path.clone());
                 move || {
                     std::fs::rename(&from_path, &to_path).map_err(|err| {
@@ -920,6 +954,7 @@ impl LenEntry for FileEntryImpl {
             })
             .await
             .unwrap_or_else(|err| Err((err, false)));
+        retirement_detail("entry_after_rename");
         if let Err((err, source_gone)) = renamed {
             if source_gone {
                 // The file is already gone — typically another thread's
@@ -1540,10 +1575,19 @@ struct WriteTrace {
     state: parking_lot::Mutex<WriteTraceState>,
 }
 
+tokio::task_local! {
+    static RETIRE_TRACE: Arc<WriteTrace>;
+}
+
+fn retirement_detail(stage: &'static str) {
+    let _ = RETIRE_TRACE.try_with(|trace| trace.retirement_detail(stage));
+}
+
 #[derive(Debug)]
 struct WriteTraceState {
     phase: WritePhase,
     phase_started: Instant,
+    retirement_stage: Option<(&'static str, usize, Instant)>,
     /// The stages finished so far, in order, with how long each took.
     finished: Vec<(WritePhase, Duration)>,
     /// The duplicate check's answer, once it has one.
@@ -1589,6 +1633,7 @@ impl WriteTrace {
             state: parking_lot::Mutex::new(WriteTraceState {
                 phase,
                 phase_started: now,
+                retirement_stage: None,
                 finished: Vec::new(),
                 duplicate: None,
                 duplicate_failure: None,
@@ -1659,6 +1704,16 @@ impl WriteTrace {
         self.state.lock().inserted = true;
     }
 
+    fn retirement_stage(&self, stage: &'static str, count: usize) {
+        self.state.lock().retirement_stage = Some((stage, count, Instant::now()));
+    }
+
+    fn retirement_detail(&self, stage: &'static str) {
+        let mut state = self.state.lock();
+        let count = state.retirement_stage.map_or(0, |(_, count, _)| count);
+        state.retirement_stage = Some((stage, count, Instant::now()));
+    }
+
     /// Records how the detached part of the write ended, and reports it if
     /// the caller is gone, as nobody else will.
     fn end(&self, outcome: String) {
@@ -1688,6 +1743,9 @@ impl WriteTrace {
         state.caller_gone = true;
         let dropped_in = state.phase;
         let phase_ms = state.phase_started.elapsed().as_millis();
+        let retirement = state
+            .retirement_stage
+            .map(|(stage, count, started)| (stage, count, started.elapsed().as_millis()));
         if !dropped_in.detached() && dropped_in != WritePhase::Ended {
             let stopped = format!(
                 "not inserted: its caller stopped waiting in {}",
@@ -1709,6 +1767,7 @@ impl WriteTrace {
             write_id = self.id,
             elapsed_ms = self.started.elapsed().as_millis(),
             phase_ms,
+            retirement = ?retirement,
             duplicate = ?state.duplicate,
             outcome = ?state.outcome,
             stages = %state.finished_stages(),
@@ -1775,6 +1834,22 @@ impl<Fe: FileEntry> AfterPublication<Fe> {
         match self {
             Self::Inserted(cleanup) => drop(cleanup.run().await),
             Self::Superseded(entry) => entry.unref().await,
+        }
+    }
+
+    async fn run_traced(self, trace: &WriteTrace) {
+        match self {
+            Self::Inserted(cleanup) => drop(
+                cleanup
+                    .run_observed(|stage, count| {
+                        trace.retirement_stage(stage, count);
+                    })
+                    .await,
+            ),
+            Self::Superseded(entry) => {
+                trace.retirement_stage("superseded_unref", 1);
+                entry.unref().await;
+            }
         }
     }
 }
@@ -1919,11 +1994,12 @@ impl<Fe: FileEntry> RemoveItemCallback for ExecutableVariantRemover<Fe> {
                 "{}{EXECUTABLE_DIR_SUFFIX}/{DIGEST_FOLDER_V2}/{digest}",
                 self.content_path
             );
+            retirement_detail("variant_lease");
             let lease = ExecutableVariantLease::acquire(&self.executable_locks, digest).await;
             let evicting_map = self.evicting_map.clone();
             let retired = self
                 .shared_context
-                .retire_blocking({
+                .retire_blocking(RetirementKind::Variant, {
                     let variant_path = variant_path.clone();
                     move || {
                         // Released only once the unlink has really ended, even
@@ -1947,6 +2023,7 @@ impl<Fe: FileEntry> RemoveItemCallback for ExecutableVariantRemover<Fe> {
                 })
                 .await
                 .and_then(|retired| retired);
+            retirement_detail("callback_after_variant");
             match retired {
                 Ok(VariantRetirement::Deleted) => debug!(
                     ?variant_path,
@@ -2831,7 +2908,9 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
                 AfterPublication::Superseded(_) => "superseded by a newer generation",
             };
             trace.enter(WritePhase::Retire);
-            published.run().await;
+            RETIRE_TRACE
+                .scope(trace.clone(), published.run_traced(&trace))
+                .await;
             trace.end(outcome.to_owned());
             Ok(())
         })
@@ -3461,7 +3540,7 @@ mod retirement_admission_tests {
         let first = background_spawn!("first_retirement", {
             let ctx = ctx.clone();
             async move {
-                ctx.retire_blocking(move || {
+                ctx.retire_blocking(super::RetirementKind::Rename, move || {
                     entered_tx.send(()).unwrap();
                     release_rx.recv().unwrap();
                 })
@@ -3484,8 +3563,10 @@ mod retirement_admission_tests {
         let second = background_spawn!("second_retirement", {
             let ctx = ctx.clone();
             async move {
-                ctx.retire_blocking(move || second_tx.send(()).unwrap())
-                    .await
+                ctx.retire_blocking(super::RetirementKind::Rename, move || {
+                    second_tx.send(()).unwrap()
+                })
+                .await
             }
         });
         for _ in 0..32 {
@@ -3523,6 +3604,185 @@ mod write_trace_tests {
         trace.enter(phase);
         let caller = CallerWaiting(Some(trace.clone()));
         (trace, caller)
+    }
+
+    #[test]
+    fn retirement_stage_is_scoped_to_each_write_and_survives_caller_drop() {
+        let (first, caller) = trace_in(WritePhase::Retire);
+        let (second, second_caller) = trace_in(WritePhase::Retire);
+        first.retirement_stage("callbacks", 4);
+        second.retirement_stage("unrefs", 7);
+        drop(caller);
+        assert_eq!(
+            first
+                .state
+                .lock()
+                .retirement_stage
+                .map(|(stage, count, _)| (stage, count)),
+            Some(("callbacks", 4))
+        );
+        assert_eq!(
+            second
+                .state
+                .lock()
+                .retirement_stage
+                .map(|(stage, count, _)| (stage, count)),
+            Some(("unrefs", 7))
+        );
+        assert_ne!(first.id, second.id);
+        drop(second_caller);
+    }
+
+    #[nativelink_macro::nativelink_test]
+    async fn scoped_retirement_reports_admission_while_permit_is_held() {
+        use core::task::Poll;
+        use futures::poll;
+        let ctx = super::SharedContext::new(String::new(), String::new());
+        let permit = ctx.retirement.clone().acquire_owned().await.unwrap();
+        let (trace, caller) = trace_in(WritePhase::Retire);
+        trace.retirement_stage("callbacks", 3);
+        let future = super::RETIRE_TRACE.scope(
+            trace.clone(),
+            ctx.retire_blocking(super::RetirementKind::Rename, || ()),
+        );
+        tokio::pin!(future);
+        assert!(matches!(poll!(&mut future), Poll::Pending));
+        assert_eq!(
+            trace
+                .state
+                .lock()
+                .retirement_stage
+                .map(|(stage, count, _)| (stage, count)),
+            Some(("rename_admission", 3))
+        );
+        drop(caller);
+        drop(permit);
+        tokio::time::timeout(std::time::Duration::from_secs(5), future)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[nativelink_macro::nativelink_test]
+    async fn concurrent_scopes_keep_operation_and_admission_attributed() {
+        use std::time::Duration;
+        let ctx = std::sync::Arc::new(super::SharedContext::new(String::new(), String::new()));
+        let (first, first_caller) = trace_in(WritePhase::Retire);
+        let (second, second_caller) = trace_in(WritePhase::Retire);
+        first.retirement_stage("callbacks", 3);
+        second.retirement_stage("unrefs", 7);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let first_task = tokio::spawn(super::RETIRE_TRACE.scope(first.clone(), {
+            let ctx = ctx.clone();
+            async move {
+                ctx.retire_blocking(super::RetirementKind::Rename, move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .await
+                .unwrap();
+            }
+        }));
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let second_task = tokio::spawn(super::RETIRE_TRACE.scope(second.clone(), {
+            let ctx = ctx.clone();
+            async move {
+                ctx.retire_blocking(super::RetirementKind::Variant, || ())
+                    .await
+                    .unwrap();
+            }
+        }));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if second.state.lock().retirement_stage.map(|s| s.0) == Some("variant_admission") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_ne!(first.id, second.id);
+        assert_eq!(
+            first.state.lock().retirement_stage.map(|(s, n, _)| (s, n)),
+            Some(("rename_operation", 3))
+        );
+        assert_eq!(
+            second.state.lock().retirement_stage.map(|(s, n, _)| (s, n)),
+            Some(("variant_admission", 7))
+        );
+        drop(first_caller);
+        drop(second_caller);
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), first_task)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), second_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first.state.lock().retirement_stage.map(|(s, _, _)| s),
+            Some("rename_completion_handoff")
+        );
+        assert_eq!(
+            second.state.lock().retirement_stage.map(|(s, _, _)| s),
+            Some("variant_completion_handoff")
+        );
+    }
+
+    #[test]
+    fn queued_retirement_reports_queue_until_blocking_worker_is_available() {
+        use std::time::Duration;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            });
+            tokio::time::timeout(Duration::from_secs(5), entered_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            let ctx = super::SharedContext::new(String::new(), String::new());
+            let (trace, caller) = trace_in(WritePhase::Retire);
+            trace.retirement_stage("unrefs", 2);
+            let future = super::RETIRE_TRACE.scope(
+                trace.clone(),
+                ctx.retire_blocking(super::RetirementKind::Rename, || ()),
+            );
+            tokio::pin!(future);
+            assert!(matches!(
+                futures::poll!(&mut future),
+                core::task::Poll::Pending
+            ));
+            assert_eq!(
+                trace.state.lock().retirement_stage.map(|(s, n, _)| (s, n)),
+                Some(("rename_queue", 2))
+            );
+            drop(caller);
+            release_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), future)
+                .await
+                .unwrap()
+                .unwrap();
+            blocker.await.unwrap();
+            assert_eq!(
+                trace.state.lock().retirement_stage.map(|(s, _, _)| s),
+                Some("rename_completion_handoff")
+            );
+        });
     }
 
     fn check_failure() -> Error {

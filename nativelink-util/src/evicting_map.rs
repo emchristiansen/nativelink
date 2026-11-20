@@ -215,8 +215,23 @@ impl<T: LenEntry + Send + Sync> InsertCleanup<T> {
     /// the insertion replaced, if any), or `None` if the insertion displaced
     /// nothing.
     pub async fn run(self) -> Option<T> {
-        run_removal_callbacks(self.removal_futures).await;
-        unref_all(&self.items_to_unref).await;
+        self.run_observed(|_, _| {}).await
+    }
+
+    /// Report each sequential cleanup item before entering it. The count is
+    /// the number remaining, including the current item. The observer must be
+    /// cheap and must not block; it does not change cleanup ordering.
+    pub async fn run_observed(self, mut observe: impl FnMut(&'static str, usize)) -> Option<T> {
+        let callbacks = self.removal_futures.len();
+        for (index, future) in self.removal_futures.into_iter().enumerate() {
+            observe("callbacks", callbacks - index);
+            future.await;
+        }
+        let items = self.items_to_unref.len();
+        for (index, item) in self.items_to_unref.iter().enumerate() {
+            observe("unrefs", items - index);
+            item.unref().await;
+        }
         self.items_to_unref.into_iter().next()
     }
 }
@@ -1161,6 +1176,53 @@ mod tests {
         fn is_empty(&self) -> bool {
             self.0 == 0
         }
+    }
+
+    #[nativelink_test("crate")]
+    async fn observed_cleanup_reports_callback_before_wait_and_unref_after_release() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (stage_tx, mut stage_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cleanup = super::InsertCleanup {
+            items_to_unref: vec![TestEntry(3), TestEntry(4)],
+            removal_futures: vec![Box::pin(async move {
+                release_rx.await.unwrap();
+            })],
+        };
+        let task = tokio::spawn(async move {
+            cleanup
+                .run_observed(|stage, count| stage_tx.send((stage, count)).unwrap())
+                .await
+        });
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), stage_rx.recv())
+                .await
+                .unwrap(),
+            Some(("callbacks", 1))
+        );
+        assert!(
+            stage_rx.try_recv().is_err(),
+            "unrefs cannot start before callback release"
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), stage_rx.recv())
+                .await
+                .unwrap(),
+            Some(("unrefs", 2))
+        );
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), stage_rx.recv())
+                .await
+                .unwrap(),
+            Some(("unrefs", 1))
+        );
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            Some(TestEntry(3))
+        );
     }
 
     /// A batch existence check (`has()` → `sizes_for_keys`) over resident

@@ -3598,6 +3598,236 @@ async fn concurrent_upload_burst_round_trip_test() -> Result<(), Error> {
 ///
 /// This was mitigated by making file names unique using a generation counter.
 #[nativelink_test]
+async fn diagnostic_caller_drop_during_real_eviction() -> Result<(), Error> {
+    static ENTERED: Semaphore = Semaphore::const_new(0);
+    static RELEASE: Semaphore = Semaphore::const_new(0);
+    struct Hooks;
+    impl FileEntryHooks for Hooks {
+        async fn on_unref_async<Fe: FileEntry>(entry: &Fe) {
+            if entry.len() == VALUE1.len() as u64 {
+                ENTERED.add_permits(1);
+                let permit = RELEASE.acquire().await.unwrap();
+                permit.forget();
+            }
+        }
+    }
+    let digest1 = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let other = "y".repeat(64);
+    let digest2 = DigestInfo::try_new(HASH2, other.len())?;
+    let store = Arc::new(
+        FilesystemStore::<TestFileEntry<Hooks>>::new(&FilesystemSpec {
+            content_path: make_temp_path("diagnostic-content"),
+            temp_path: make_temp_path("diagnostic-temp"),
+            eviction_policy: Some(EvictionPolicy {
+                max_count: 1,
+                ..Default::default()
+            }),
+            block_size: 1,
+            ..Default::default()
+        })
+        .await?,
+    );
+    store.update_oneshot(digest1, VALUE1.into()).await?;
+    let writer = store.clone();
+    let task = tokio::spawn(async move { writer.update_oneshot(digest2, other.into()).await });
+    let permit = tokio::time::timeout(Duration::from_secs(5), ENTERED.acquire())
+        .await
+        .unwrap()
+        .unwrap();
+    permit.forget();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(logs_contain(&format!(
+        "key={digest2} phase=retire detached_stage=true inserted=true"
+    )));
+    assert!(logs_contain("retirement=Some((\"unrefs\", 1,"));
+    RELEASE.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !logs_contain("Filesystem store write ended after its caller stopped waiting") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached cleanup did not finish");
+    assert_eq!(store.has(digest2).await?, Some(digest2.size_bytes()));
+    Ok(())
+}
+
+#[nativelink_test]
+async fn diagnostic_real_eviction_waits_for_entry_path_lock() -> Result<(), Error> {
+    static ENTERED: Semaphore = Semaphore::const_new(0);
+    struct Hooks;
+    impl FileEntryHooks for Hooks {
+        async fn on_unref_async<Fe: FileEntry>(_entry: &Fe) {
+            ENTERED.add_permits(1);
+        }
+    }
+    let digest1 = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let other = "z".repeat(64);
+    let digest2 = DigestInfo::try_new(HASH2, other.len())?;
+    let store = Arc::new(
+        FilesystemStore::<TestFileEntry<Hooks>>::new(&FilesystemSpec {
+            content_path: make_temp_path("diagnostic-lock-content"),
+            temp_path: make_temp_path("diagnostic-lock-temp"),
+            eviction_policy: Some(EvictionPolicy {
+                max_count: 1,
+                ..Default::default()
+            }),
+            block_size: 1,
+            ..Default::default()
+        })
+        .await?,
+    );
+    store.update_oneshot(digest1, VALUE1.into()).await?;
+    let entry = store.get_file_entry_for_digest(&digest1).await?;
+    let held = entry.get_encoded_file_path().read().await;
+    let writer = store.clone();
+    let task = tokio::spawn(async move { writer.update_oneshot(digest2, other.into()).await });
+    let permit = tokio::time::timeout(Duration::from_secs(5), ENTERED.acquire())
+        .await
+        .unwrap()
+        .unwrap();
+    permit.forget();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(logs_contain("retirement=Some((\"entry_path_lock\", 1,"));
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !logs_contain("Filesystem store write ended after its caller stopped waiting") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached cleanup did not finish");
+    assert_eq!(store.has(digest2).await?, Some(digest2.size_bytes()));
+    Ok(())
+}
+
+#[nativelink_test]
+async fn diagnostic_concurrent_same_store_writes_are_distinct() -> Result<(), Error> {
+    static ENTERED: Semaphore = Semaphore::const_new(0);
+    static RELEASE: Semaphore = Semaphore::const_new(0);
+    struct Hooks;
+    impl FileEntryHooks for Hooks {
+        async fn on_unref_async<Fe: FileEntry>(entry: &Fe) {
+            ENTERED.add_permits(1);
+            if entry.len() == 20 {
+                RELEASE.acquire().await.unwrap().forget();
+            }
+        }
+    }
+    let first = DigestInfo::try_new(HASH1, 10)?;
+    let second = DigestInfo::try_new(HASH2, 20)?;
+    let third = DigestInfo::try_new("a".repeat(64).as_str(), 30)?;
+    let fourth = DigestInfo::try_new("b".repeat(64).as_str(), 40)?;
+    let store = Arc::new(
+        FilesystemStore::<TestFileEntry<Hooks>>::new(&FilesystemSpec {
+            content_path: make_temp_path("diagnostic-concurrent-content"),
+            temp_path: make_temp_path("diagnostic-concurrent-temp"),
+            eviction_policy: Some(EvictionPolicy {
+                max_count: 2,
+                ..Default::default()
+            }),
+            block_size: 1,
+            ..Default::default()
+        })
+        .await?,
+    );
+    store.update_oneshot(first, "1".repeat(10).into()).await?;
+    store.update_oneshot(second, "2".repeat(20).into()).await?;
+    let entry = store.get_file_entry_for_digest(&first).await?;
+    // Fetching first makes it MRU: touch second to ensure first is evicted first.
+    store.get_file_entry_for_digest(&second).await?;
+    let held = entry.get_encoded_file_path().read().await;
+    let first_writer = store.clone();
+    let a = tokio::spawn(async move {
+        first_writer
+            .update_oneshot(third, "3".repeat(30).into())
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), ENTERED.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let second_writer = store.clone();
+    let b = tokio::spawn(async move {
+        second_writer
+            .update_oneshot(fourth, "4".repeat(40).into())
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), ENTERED.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    a.abort();
+    b.abort();
+    assert!(a.await.unwrap_err().is_cancelled());
+    assert!(b.await.unwrap_err().is_cancelled());
+    assert!(logs_contain(&format!(
+        "key={third} phase=retire detached_stage=true inserted=true"
+    )));
+    assert!(logs_contain(&format!(
+        "key={fourth} phase=retire detached_stage=true inserted=true"
+    )));
+    assert!(logs_contain("retirement=Some((\"entry_path_lock\", 1,"));
+    assert!(logs_contain("retirement=Some((\"unrefs\", 1,"));
+    drop(held);
+    RELEASE.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if logs_contain(&format!(
+                "Filesystem store write ended after its caller stopped waiting key={third}"
+            )) && logs_contain(&format!(
+                "Filesystem store write ended after its caller stopped waiting key={fourth}"
+            )) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both detached writes must finish");
+    logs_assert(|lines| {
+        let mut ids = Vec::new();
+        for (key, stage) in [(third, "entry_path_lock"), (fourth, "unrefs")] {
+            let key_field = format!("key={key}");
+            let drop_line = lines
+                .iter()
+                .find(|line| {
+                    line.contains("Caller stopped waiting for a filesystem store write")
+                        && line.contains(&key_field)
+                        && line.contains(&format!("retirement=Some((\"{stage}\", 1,"))
+                })
+                .ok_or_else(|| format!("missing {stage} drop for {key}"))?;
+            let id = drop_line
+                .split("write_id=")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .ok_or_else(|| format!("missing write_id for {key}"))?;
+            if !lines.iter().any(|line| {
+                line.contains("Filesystem store write ended after its caller stopped waiting")
+                    && line.contains(&key_field)
+                    && line.contains(&format!("write_id={id} "))
+            }) {
+                return Err(format!(
+                    "missing matching completion for {key} write_id={id}"
+                ));
+            }
+            ids.push(id);
+        }
+        if ids[0] == ids[1] {
+            return Err("concurrent writes shared an ID".into());
+        }
+        Ok(())
+    });
+    assert_eq!(store.has(third).await?, Some(30));
+    assert_eq!(store.has(fourth).await?, Some(40));
+    Ok(())
+}
+
+#[nativelink_test]
 async fn stale_unref_must_not_delete_reuploaded_file() -> Result<(), Error> {
     static UNREF_GATE: Semaphore = Semaphore::const_new(0);
 
