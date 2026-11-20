@@ -1574,11 +1574,15 @@ async fn publish_file<Fe: FileEntry>(
 ///
 /// - Materialization holds the same lease, so the unlink never races a
 ///   variant being published.
-/// - Fast-path readers skip a digest whose lease is held
-///   ([`FilesystemStore::variant_leases_held`]). A reader that returns an
-///   existing variant therefore looked before this callback took the lease,
-///   and a caller that keeps the digest resident (a worker leases its inputs)
-///   is still resident when the callback checks, so the variant is kept.
+/// - Fast-path readers return an existing variant only for a digest they saw
+///   resident and then saw with its lease free
+///   ([`FilesystemStore::variants_servable_without_lease`]). Such a reader
+///   looked before this callback took the lease, and a caller that keeps the
+///   digest resident (a worker leases its inputs) is still resident when the
+///   callback checks, so the variant is kept. A lease on a digest that is not
+///   resident does not protect its variant: this callback may already be
+///   waiting to delete it, so such a reader takes the per-digest path, whose
+///   caller populates the digest first.
 /// - A resident generation's own removal later retires the variant.
 ///
 /// Cancelled before its unlink starts, the callback deletes nothing: the
@@ -1715,7 +1719,7 @@ type ExecutableLocks = std::sync::Mutex<HashMap<DigestInfo, Arc<Mutex<()>>>>;
 
 /// Exclusive right to materialize or delete one digest's executable variant.
 /// Materialization and [`ExecutableVariantRemover`] both hold it, and readers
-/// that skip it check that no one holds it ([`FilesystemStore::variant_leases_held`]).
+/// that skip it check that no one holds it ([`FilesystemStore::variants_servable_without_lease`]).
 ///
 /// A lease holds the digest's lock *and* that lock is still the digest's
 /// entry in [`ExecutableLocks`]. Only a lease removes the entry, when it is
@@ -1991,7 +1995,9 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     }
 
     /// Reserve a digest before it is populated so active action inputs cannot
-    /// be evicted while they are being materialized.
+    /// be evicted while they are being materialized. The lease does not make
+    /// an absent digest resident: until it is populated, its executable
+    /// variant is not served (see [`Self::get_executable_hardlink_source`]).
     pub fn lease_digest(&self, digest: &DigestInfo) {
         let key: StoreKey<'static> = (*digest).into();
         self.evicting_map.lease_key(StoreKeyBorrow::from(key));
@@ -2046,6 +2052,13 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     /// A variant whose blob is no longer indexed is reported `NotFound`, not
     /// handed out: the caller then fills the fast store again, which puts the
     /// blob back in the index so its next eviction deletes the variant too.
+    ///
+    /// Each result is otherwise what [`Self::get_executable_hardlink_source`]
+    /// returns for its digest, under the same lifetime precondition. That
+    /// index check comes after the stat, so on its own it cannot exclude a
+    /// variant whose deletion had started before the digest was indexed
+    /// again; `materialized_variants` already counts only digests seen
+    /// resident before their lease was seen free.
     pub async fn get_executable_hardlink_sources(
         &self,
         digests: &[DigestInfo],
@@ -2085,32 +2098,43 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             .await
     }
 
-    /// Whether someone holds each digest's [`ExecutableVariantLease`], that
-    /// is, may be materializing or deleting its variant. A reader that finds an
-    /// existing variant may return it without the lease only if it saw the
-    /// lease free *before* looking at the file: see [`ExecutableVariantRemover`].
+    /// Whether a reader that finds each digest's variant may return it without
+    /// taking its [`ExecutableVariantLease`]: a generation of the digest is
+    /// resident, and then no one holds the lease, that is, no one may be
+    /// materializing or deleting the variant. Both must be seen in that order
+    /// and *before* looking at the file: see [`ExecutableVariantRemover`],
+    /// which keeps the variant only if a generation is resident when it checks
+    /// under the lease. Seeing the lease free first would miss a removal that
+    /// took the lease, found no generation and is deleting the variant while
+    /// the digest is populated again.
     #[cfg(unix)]
-    fn variant_leases_held(&self, digests: &[DigestInfo]) -> Vec<bool> {
+    fn variants_servable_without_lease(&self, digests: &[DigestInfo]) -> Vec<bool> {
+        let resident: Vec<bool> = digests
+            .iter()
+            .map(|digest| self.evicting_map.is_resident(&StoreKey::Digest(*digest)))
+            .collect();
         let locks = self
             .executable_locks
             .lock()
             .expect("executable_locks poisoned");
         digests
             .iter()
-            .map(|digest| locks.contains_key(digest))
+            .zip(resident)
+            .map(|(digest, resident)| resident && !locks.contains_key(digest))
             .collect()
     }
 
     /// Reports which digests already have an executable variant on disk, in one
-    /// batched existence check. A digest whose lease is held counts as a miss,
-    /// so it takes the per-digest path and waits for the lease.
+    /// batched existence check. A digest that is not resident or whose lease is
+    /// held counts as a miss, so it takes the per-digest path, which waits for
+    /// the lease and needs the blob resident.
     #[cfg(unix)]
     async fn materialized_variants(&self, digests: &[DigestInfo]) -> Vec<Option<OsString>> {
         let paths: Vec<OsString> = digests
             .iter()
             .map(|digest| self.executable_variant_path(digest))
             .collect();
-        let leases_held = self.variant_leases_held(digests);
+        let servable = self.variants_servable_without_lease(digests);
 
         // Variants disabled and a failed batch are the same situation: nothing
         // is known to exist, so every digest takes the per-digest path, which
@@ -2127,8 +2151,8 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         paths
             .into_iter()
             .zip(exists)
-            .zip(leases_held)
-            .map(|((path, hit), held)| (hit && !held).then_some(path))
+            .zip(servable)
+            .map(|((path, hit), servable)| (hit && servable).then_some(path))
             .collect()
     }
 
@@ -2155,6 +2179,20 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     /// **once** — writer fd fsync'd and closed, then atomically renamed into
     /// place before the inode is ever hardlinked or executed — and hardlinking
     /// it thereafter keeps the per-action path hardlink-only.
+    ///
+    /// Lifetime: the result is a bare path, not a handle, and the variant is
+    /// deleted by a removal of the digest's entry (see
+    /// `ExecutableVariantRemover`). A caller that holds a lease on the
+    /// digest ([`Self::lease_digest`]) from before this call until it has
+    /// hardlinked the path, as a worker does for its action's inputs, finds
+    /// the variant still there despite automatic eviction and despite the
+    /// pending cleanup of an older removal: a path is returned only while a
+    /// generation of the digest is resident, and the lease keeps that
+    /// generation from being evicted. A digest that is leased but not resident
+    /// gets an error, not its existing variant, so the caller populates it
+    /// first. Nothing protects an unleased caller, an explicit removal of the
+    /// leased entry (such as dropping an entry whose file went missing), or
+    /// deletion from outside the store.
     #[cfg(unix)]
     pub async fn get_executable_hardlink_source(
         &self,
@@ -2169,9 +2207,10 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         let variant_path = self.executable_variant_path(digest);
 
         // Fast path: the variant already exists, so the caller can hardlink it
-        // with no writable fd anywhere in sight. Unless someone holds the
-        // lease, which may mean a removal is about to delete the file.
-        if !self.variant_leases_held(core::slice::from_ref(digest))[0]
+        // with no writable fd anywhere in sight. Unless the digest is not
+        // resident or someone holds the lease: either may mean a removal is
+        // about to delete the file.
+        if self.variants_servable_without_lease(core::slice::from_ref(digest))[0]
             && fs::metadata(&variant_path).await.is_ok()
         {
             return Ok(variant_path);

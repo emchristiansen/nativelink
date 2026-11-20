@@ -846,6 +846,302 @@ mod tests {
         Ok(())
     }
 
+    /// A fast-store remove callback for one key: when that key's entry is
+    /// removed, it adds a permit to `signal`, then waits for a permit from
+    /// `wait`. A removal runs its entries' callbacks one at a time, so while
+    /// one waits, every later entry of the same removal waits too.
+    #[cfg(target_family = "unix")]
+    #[derive(Debug)]
+    struct OnRemoval {
+        key: DigestInfo,
+        signal: Option<Arc<Semaphore>>,
+        wait: Option<Arc<Semaphore>>,
+    }
+
+    #[cfg(target_family = "unix")]
+    impl RemoveItemCallback for OnRemoval {
+        fn callback<'a>(
+            &'a self,
+            store_key: StoreKey<'a>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            Box::pin(async move {
+                if store_key != StoreKey::Digest(self.key) {
+                    return;
+                }
+                if let Some(signal) = &self.signal {
+                    signal.add_permits(1);
+                }
+                if let Some(wait) = &self.wait {
+                    let waited = tokio::time::timeout(Duration::from_mins(1), wait.acquire()).await;
+                    assert!(waited.is_ok(), "removal of {} waited too long", self.key);
+                }
+            })
+        }
+    }
+
+    /// An executable input whose fast-store entry was evicted, while its old
+    /// executable-variant cleanup has not yet started (it waits behind an
+    /// earlier entry's cleanup in the same eviction), must still be
+    /// materialized by an action that leases its inputs, even when that old
+    /// cleanup runs between the worker resolving the input and hardlinking
+    /// it. Here it runs while the worker populates an inline input, the last
+    /// step before the batched hardlinks.
+    #[cfg(target_family = "unix")]
+    #[nativelink_test]
+    async fn leased_executable_input_survives_old_variant_cleanup_before_hardlink()
+    -> Result<(), Box<dyn core::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        const EARLIER: &[u8] = b"earlier-01";
+        const EXECUTABLE: &[u8] = b"executable";
+        const NEWCOMER: &[u8] = b"newcomer-entry";
+        const INLINE: &[u8] = b"inline-mt1";
+
+        let earlier = DigestInfo::new([31u8; 32], EARLIER.len() as u64);
+        let executable = DigestInfo::new([32u8; 32], EXECUTABLE.len() as u64);
+        let newcomer = DigestInfo::new([33u8; 32], NEWCOMER.len() as u64);
+        let inline = DigestInfo::new([34u8; 32], INLINE.len() as u64);
+
+        let input_root = Directory {
+            files: vec![
+                FileNode {
+                    name: "tool".to_string(),
+                    digest: Some(executable.into()),
+                    is_executable: true,
+                    ..Default::default()
+                },
+                FileNode {
+                    name: "stamped".to_string(),
+                    digest: Some(inline.into()),
+                    node_properties: Some(NodeProperties {
+                        mtime: Some(
+                            SystemTime::UNIX_EPOCH
+                                .checked_add(Duration::from_secs(1_600_000_000))
+                                .unwrap()
+                                .into(),
+                        ),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        // Learn the protos' sizes first: the fast store's byte limit counts
+        // them, and they stay resident (leased) throughout.
+        let sizing = MemoryStore::new(&MemorySpec::default());
+        let proto_digests = upload_action_protos(&input_root, sizing.as_pin()).await?;
+        let proto_bytes: u64 = proto_digests
+            .iter()
+            .map(DigestInfo::size_bytes)
+            .sum::<u64>();
+
+        // With one-byte blocks the fast store holds exactly the blob sizes.
+        // The earlier and executable entries fit beside the protos; the
+        // newcomer's insertion evicts the earlier entry and then the
+        // executable one, in that order, in one removal. Populating either
+        // the executable or the inline input later evicts the newcomer.
+        let max_bytes = proto_bytes + (EARLIER.len() + EXECUTABLE.len() + 1) as u64;
+        let fast_config = FilesystemSpec {
+            content_path: make_temp_path("content_path"),
+            temp_path: make_temp_path("temp_path"),
+            block_size: 1,
+            eviction_policy: Some(EvictionPolicy {
+                max_bytes: usize::try_from(max_bytes)?,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let fast_store: Arc<FilesystemStore> = FilesystemStore::new(&fast_config).await?;
+        let slow_store = MemoryStore::new(&MemorySpec::default());
+        let cas_store = FastSlowStore::new(
+            &FastSlowSpec {
+                fast: StoreSpec::Filesystem(fast_config),
+                slow: StoreSpec::Memory(MemorySpec::default()),
+                fast_direction: StoreDirection::default(),
+                slow_direction: StoreDirection::default(),
+                bypass_dedup_threshold_bytes: 0,
+                has_slow_write_wait_timeout_s: 0,
+                leader_inactivity_timeout_s: 0,
+            },
+            Store::new(fast_store.clone()),
+            Store::new(slow_store.clone()),
+        );
+
+        let earlier_cleanup_entered = Arc::new(Semaphore::new(0));
+        let earlier_cleanup_release = Arc::new(Semaphore::new(0));
+        let executable_cleanup_done = Arc::new(Semaphore::new(0));
+        for callback in [
+            OnRemoval {
+                key: earlier,
+                signal: Some(earlier_cleanup_entered.clone()),
+                wait: Some(earlier_cleanup_release.clone()),
+            },
+            OnRemoval {
+                key: executable,
+                signal: Some(executable_cleanup_done.clone()),
+                wait: None,
+            },
+            // Whoever evicts the newcomer lets the old cleanup run and waits
+            // until it has finished with the executable's variant.
+            OnRemoval {
+                key: newcomer,
+                signal: Some(earlier_cleanup_release.clone()),
+                wait: Some(executable_cleanup_done.clone()),
+            },
+        ] {
+            fast_store
+                .clone()
+                .register_remove_callback(Arc::new(callback))?;
+        }
+
+        let action_digest = upload_action_protos(&input_root, cas_store.as_pin()).await?[0];
+        for digest in &proto_digests {
+            fast_store.lease_digest(digest);
+        }
+        fast_store
+            .as_ref()
+            .update_oneshot(earlier, EARLIER.into())
+            .await?;
+        cas_store
+            .as_ref()
+            .update_oneshot(executable, EXECUTABLE.into())
+            .await?;
+        slow_store
+            .as_ref()
+            .update_oneshot(inline, INLINE.into())
+            .await?;
+        let variant = fast_store
+            .get_executable_hardlink_source(&executable)
+            .await?;
+
+        let eviction = tokio::spawn({
+            let fast_store = fast_store.clone();
+            async move {
+                fast_store
+                    .as_ref()
+                    .update_oneshot(newcomer, NEWCOMER.into())
+                    .await
+            }
+        });
+        drop(
+            tokio::time::timeout(Duration::from_mins(1), earlier_cleanup_entered.acquire())
+                .await
+                .expect("the eviction never reached the earlier entry's cleanup"),
+        );
+        let executable_key = StoreKey::Digest(executable);
+        assert!(!fast_store.get_evicting_map().is_resident(&executable_key));
+        assert_eq!(
+            fast_store.executable_variant_lease_claims_for_test(&executable),
+            0,
+            "the old cleanup must not have taken the variant lease yet"
+        );
+        assert!(Path::new(&variant).exists());
+
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+        let running_actions_manager =
+            Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                root_action_directory,
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                ac_store: None,
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config: &UploadActionResultConfig {
+                    upload_ac_results_strategy: UploadCacheResultsStrategy::Never,
+                    ..Default::default()
+                },
+                max_action_timeout: Duration::from_mins(10),
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                max_download_timeout: Duration::from_secs(DEFAULT_MAX_DOWNLOAD_TIMEOUT),
+                max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
+                max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
+                timeout_handled_externally: false,
+                active_input_leases: true,
+                #[cfg(target_os = "linux")]
+                readonly_input_mounts: Vec::new(),
+                directory_cache: None,
+                #[cfg(target_os = "linux")]
+                use_namespaces: use_namespaces(),
+            })?);
+        let action = running_actions_manager
+            .create_and_add_action(
+                "test-worker".to_string(),
+                StartExecute {
+                    request_metadata: None,
+                    execute_request: Some(ExecuteRequest {
+                        action_digest: Some(action_digest.into()),
+                        digest_function: ProtoDigestFunction::Sha256.into(),
+                        ..Default::default()
+                    }),
+                    operation_id: OperationId::default().to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let prepared = action.clone().prepare_action().await;
+        // The newcomer's eviction, which waits for the old cleanup to finish,
+        // happened while the worker populated an input, so before it made
+        // the hardlinks.
+        assert!(
+            !fast_store
+                .get_evicting_map()
+                .is_resident(&StoreKey::Digest(newcomer)),
+            "the old cleanup must have run during preparation"
+        );
+        let prepared = prepared.map_err(|err| {
+            format!("preparing the action failed after the old variant cleanup ran: {err:?}")
+        })?;
+        tokio::time::timeout(Duration::from_mins(1), eviction)
+            .await
+            .expect("the eviction did not finish")??;
+
+        let tool = format!("{}/tool", prepared.get_work_directory());
+        assert_eq!(std::fs::read(&tool)?, EXECUTABLE);
+        assert_eq!(
+            std::fs::metadata(&tool)?.permissions().mode() & 0o777,
+            0o555,
+            "executable input must be 0o555"
+        );
+        assert!(
+            fast_store.get_evicting_map().is_resident(&executable_key),
+            "the leased executable input is resident"
+        );
+        assert!(Path::new(&variant).exists());
+
+        drop(prepared.cleanup().await?);
+        fast_store.release_digests(&proto_digests).await;
+        Ok(())
+    }
+
+    /// Uploads the action, command and `input_root` protos to `store`,
+    /// returning their digests, the action's first.
+    #[cfg(target_family = "unix")]
+    async fn upload_action_protos(
+        input_root: &Directory,
+        store: Pin<&impl StoreLike>,
+    ) -> Result<[DigestInfo; 3], Error> {
+        let input_root_digest =
+            serialize_and_upload_message(input_root, store, &mut DigestHasherFunc::Sha256.hasher())
+                .await?;
+        let command_digest = serialize_and_upload_message(
+            &Command::default(),
+            store,
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action_digest = serialize_and_upload_message(
+            &Action {
+                command_digest: Some(command_digest.into()),
+                input_root_digest: Some(input_root_digest.into()),
+                ..Default::default()
+            },
+            store,
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        Ok([action_digest, command_digest, input_root_digest])
+    }
+
     #[nativelink_test]
     async fn action_inputs_stay_evictable_when_leases_disabled()
     -> Result<(), Box<dyn core::error::Error>> {

@@ -2694,6 +2694,286 @@ async fn cancelled_delayed_removal_leaves_variant_lease_free() -> Result<(), Err
     Ok(())
 }
 
+/// A remove callback that holds the cleanup of every entry removed after
+/// `key` in the same removal: removals run their entries' callbacks one at a
+/// time, so while this waits, a later entry's executable-variant cleanup has
+/// not started and holds no variant lease.
+#[cfg(target_family = "unix")]
+#[derive(Debug)]
+struct CleanupGate {
+    key: DigestInfo,
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+#[cfg(target_family = "unix")]
+impl RemoveItemCallback for CleanupGate {
+    fn callback<'a>(
+        &'a self,
+        store_key: StoreKey<'a>,
+    ) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            if store_key != StoreKey::Digest(self.key) {
+                return;
+            }
+            self.entered.add_permits(1);
+            drop(self.release.acquire().await);
+        })
+    }
+}
+
+/// Which source a worker's executable lookup goes through.
+#[cfg(target_family = "unix")]
+#[derive(Clone, Copy, Debug)]
+enum ExecutableLookup {
+    /// [`FilesystemStore::get_executable_hardlink_sources`], the worker's
+    /// batched input-tree path.
+    Batch,
+    /// [`FilesystemStore::get_executable_hardlink_source`].
+    Single,
+}
+
+#[cfg(target_family = "unix")]
+async fn lookup_executable(
+    store: &FilesystemStore<FileEntryImpl>,
+    lookup: ExecutableLookup,
+    digest: DigestInfo,
+) -> Result<OsString, Error> {
+    match lookup {
+        ExecutableLookup::Batch => store
+            .get_executable_hardlink_sources(&[digest])
+            .await
+            .pop()
+            .expect("one result per digest"),
+        ExecutableLookup::Single => store.get_executable_hardlink_source(&digest).await,
+    }
+}
+
+/// Resolves `digest`'s executable source the way the worker's
+/// `resolve_exec_files` does: a failed lookup means the blob is not resident,
+/// so the worker populates the fast store (here, uploads it again) and
+/// resolves once more. Returns the source and whether the first lookup
+/// already accepted it.
+#[cfg(target_family = "unix")]
+async fn resolve_executable_like_worker(
+    store: &FilesystemStore<FileEntryImpl>,
+    lookup: ExecutableLookup,
+    digest: DigestInfo,
+    value: &'static str,
+) -> Result<(OsString, bool), Error> {
+    if let Ok(source) = lookup_executable(store, lookup, digest).await {
+        return Ok((source, true));
+    }
+    store.update_oneshot(digest, value.into()).await?;
+    let source = store
+        .get_executable_hardlink_source(&digest)
+        .await
+        .err_tip(|| "Resolving executable variant after populating")?;
+    Ok((source, false))
+}
+
+/// Where the digest's primary entry stands when the worker resolves its
+/// executable source, after the digest's old removal has taken the entry out
+/// but before that removal's variant cleanup has started.
+#[cfg(target_family = "unix")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrimaryAtLookup {
+    /// The worker's lease reserves the digest, but nothing put it back.
+    ReservedAbsent,
+    /// The worker leased the digest and uploaded it again.
+    Reinserted,
+}
+
+/// An eviction takes `digest`'s entry out of the map, but its
+/// executable-variant cleanup waits, before taking the variant lease, behind
+/// an earlier entry's cleanup. A worker then leases the digest, resolves its
+/// executable source and only later hardlinks it, after the old cleanup has
+/// run. The hardlink must find the variant: a source the worker accepted is
+/// one the old cleanup leaves in place.
+#[cfg(target_family = "unix")]
+async fn check_old_cleanup_before_variant_lease(
+    lookup: ExecutableLookup,
+    primary: PrimaryAtLookup,
+) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
+
+    const EARLIER: &str = "earlier-01";
+    const EXECUTABLE: &str = "executable";
+    const NEWCOMER: &str = "newcomer-entry";
+    const EARLIER_HASH: &str = "0123456789abcdef000000000000000000030000000000000123456789abcdef";
+    const NEWCOMER_HASH: &str = "0123456789abcdef000000000000000000040000000000000123456789abcdef";
+
+    let content_path = make_temp_path("content_path");
+    // With one-byte blocks the map holds exactly the blob sizes. The earlier
+    // and executable entries fit together; the newcomer's insertion evicts
+    // the earlier entry and then the executable one, in that order, in one
+    // removal.
+    let max_bytes = EARLIER.len() + EXECUTABLE.len() + 1;
+    assert!(EXECUTABLE.len() + NEWCOMER.len() >= max_bytes);
+    assert!(NEWCOMER.len() < max_bytes);
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: content_path.clone(),
+        temp_path: make_temp_path("temp_path"),
+        block_size: 1,
+        eviction_policy: Some(EvictionPolicy {
+            max_bytes,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .await?;
+    let earlier = DigestInfo::try_new(EARLIER_HASH, EARLIER.len())?;
+    let digest = DigestInfo::try_new(HASH1, EXECUTABLE.len())?;
+    let newcomer = DigestInfo::try_new(NEWCOMER_HASH, NEWCOMER.len())?;
+    let key = StoreKey::Digest(digest);
+
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    store
+        .clone()
+        .register_remove_callback(Arc::new(CleanupGate {
+            key: earlier,
+            entered: entered.clone(),
+            release: release.clone(),
+        }))?;
+
+    store.update_oneshot(earlier, EARLIER.into()).await?;
+    store.update_oneshot(digest, EXECUTABLE.into()).await?;
+    let variant = store.get_executable_hardlink_source(&digest).await?;
+    assert!(Path::new(&variant).exists());
+
+    let eviction = background_spawn!("evicting_insertion", {
+        let store = store.clone();
+        async move { store.update_oneshot(newcomer, NEWCOMER.into()).await }
+    });
+    drop(
+        tokio::time::timeout(TASK_JOIN_LIMIT, entered.acquire())
+            .await
+            .expect("the eviction never reached the earlier entry's cleanup"),
+    );
+    assert!(!store.get_evicting_map().is_resident(&key));
+    assert_eq!(
+        store.executable_variant_lease_claims_for_test(&digest),
+        0,
+        "the old cleanup must not have taken the variant lease yet"
+    );
+    assert!(
+        Path::new(&variant).exists(),
+        "the old cleanup has deleted nothing yet"
+    );
+
+    store.lease_digest(&digest);
+    if primary == PrimaryAtLookup::Reinserted {
+        store.update_oneshot(digest, EXECUTABLE.into()).await?;
+    }
+    let (source, accepted_at_first_lookup) =
+        resolve_executable_like_worker(&store, lookup, digest, EXECUTABLE).await?;
+    assert_eq!(source, variant);
+    info!(
+        ?lookup,
+        ?primary,
+        accepted_at_first_lookup,
+        "resolved executable source before the old cleanup ran"
+    );
+
+    // The old cleanup now runs to completion before the worker hardlinks.
+    release.add_permits(1);
+    join_bounded(eviction).await?;
+
+    let input = format!("{content_path}-input");
+    let linked = fs::hard_link(&source, &input).await;
+    assert!(
+        linked.is_ok(),
+        "{lookup:?}/{primary:?}: the worker accepted {} at first lookup: \
+         {accepted_at_first_lookup}, but the old cleanup deleted it: {linked:?}",
+        Path::new(&source).display()
+    );
+    assert_eq!(
+        read_file_contents(OsStr::new(&input)).await?,
+        EXECUTABLE.as_bytes()
+    );
+    let mode = std::fs::metadata(&input)?.permissions().mode();
+    assert_eq!(mode & 0o777, 0o555, "executable input must be 0o555");
+    assert!(
+        store.get_evicting_map().is_resident(&key),
+        "the leased digest the worker linked from is resident"
+    );
+    store.release_digests(&[digest]).await;
+    Ok(())
+}
+
+#[cfg(target_family = "unix")]
+#[nativelink_test]
+async fn batch_lookup_of_reserved_absent_digest_survives_old_cleanup() -> Result<(), Error> {
+    check_old_cleanup_before_variant_lease(ExecutableLookup::Batch, PrimaryAtLookup::ReservedAbsent)
+        .await
+}
+
+#[cfg(target_family = "unix")]
+#[nativelink_test]
+async fn single_lookup_of_reserved_absent_digest_survives_old_cleanup() -> Result<(), Error> {
+    check_old_cleanup_before_variant_lease(
+        ExecutableLookup::Single,
+        PrimaryAtLookup::ReservedAbsent,
+    )
+    .await
+}
+
+#[cfg(target_family = "unix")]
+#[nativelink_test]
+async fn batch_lookup_of_reinserted_digest_survives_old_cleanup() -> Result<(), Error> {
+    check_old_cleanup_before_variant_lease(ExecutableLookup::Batch, PrimaryAtLookup::Reinserted)
+        .await
+}
+
+#[cfg(target_family = "unix")]
+#[nativelink_test]
+async fn single_lookup_of_reinserted_digest_survives_old_cleanup() -> Result<(), Error> {
+    check_old_cleanup_before_variant_lease(ExecutableLookup::Single, PrimaryAtLookup::Reinserted)
+        .await
+}
+
+/// Control for the tests above: when the old cleanup already holds the
+/// variant lease, a worker's lookup of the reserved but absent digest does not
+/// take the warm path. It populates the digest, and the cleanup, admitted
+/// afterwards, keeps the variant of the now-resident digest.
+#[cfg(target_family = "unix")]
+#[nativelink_test]
+async fn lookup_of_reserved_absent_digest_waits_for_cleanup_holding_variant_lease()
+-> Result<(), Error> {
+    let content_path = make_temp_path("content_path");
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: content_path.clone(),
+        temp_path: make_temp_path("temp_path"),
+        ..Default::default()
+    })
+    .await?;
+    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    store.update_oneshot(digest, VALUE1.into()).await?;
+    let variant = store.get_executable_hardlink_source(&digest).await?;
+    let (admission, removal) = start_delayed_removal(&store, digest).await?;
+    assert_eq!(store.executable_variant_lease_claims_for_test(&digest), 1);
+
+    store.lease_digest(&digest);
+    let first = store.get_executable_hardlink_sources(&[digest]).await;
+    assert!(
+        first[0].is_err(),
+        "a digest whose variant lease is held is not a warm hit: {first:?}"
+    );
+    store.update_oneshot(digest, VALUE1.into()).await?;
+    let resolve = background_spawn!("resolve_after_populate", {
+        let store = store.clone();
+        async move { store.get_executable_hardlink_source(&digest).await }
+    });
+    drop(admission);
+    assert!(join_bounded(removal).await);
+    let source = join_bounded(resolve).await?;
+    assert_eq!(source, variant);
+    hardlink_executable_input(&source, &format!("{content_path}-input")).await?;
+    store.release_digests(&[digest]).await;
+    Ok(())
+}
+
 /// This test simulates a full disk without needing one. It writes past the `RLIMIT_FSIZE`
 /// cap, thus failing with `EFBIG`, which tokio defers exactly like `ENOSPC`. The
 /// [`SIGXFSZ`](`libc::SIGXFSZ`) signal must be ignored or the kernel will kill the process
