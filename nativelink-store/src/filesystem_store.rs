@@ -2212,9 +2212,9 @@ impl WriteTrace {
     }
 
     fn retirement_detail(&self, stage: &'static str) {
-        let mut state = self.state.lock();
-        let count = state.retirement_stage.map_or(0, |(_, count, _)| count);
-        state.retirement_stage = Some((stage, count, Instant::now()));
+        let mut trace_state = self.state.lock();
+        let count = trace_state.retirement_stage.map_or(0, |(_, count, _)| count);
+        trace_state.retirement_stage = Some((stage, count, Instant::now()));
     }
 
     /// Records how the detached part of the write ended, and reports it if
@@ -4131,7 +4131,7 @@ mod retirement_admission_tests {
             let ctx = ctx.clone();
             async move {
                 ctx.retire_blocking(super::RetirementKind::Rename, move || {
-                    second_tx.send(()).unwrap()
+                    second_tx.send(()).unwrap();
                 })
                 .await
             }
@@ -4304,6 +4304,10 @@ mod write_trace_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "needs its own current-thread runtime with exactly one blocking thread, which tokio's spawn_blocking occupies"
+    )]
     fn queued_retirement_reports_queue_until_blocking_worker_is_available() {
         use std::time::Duration;
         let runtime = tokio::runtime::Builder::new_current_thread()
