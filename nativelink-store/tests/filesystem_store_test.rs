@@ -4341,6 +4341,50 @@ async fn partial_migration_stays_readable_and_retries_next_startup() -> Result<(
     Ok(())
 }
 
+/// Invalid declared sizes must fail before duplicate detection can accept the
+/// existing identical blob, and before finalization can publish a replacement.
+#[nativelink_test]
+async fn invalid_stream_size_does_not_accept_duplicate_or_replace_blob() -> Result<(), Error> {
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: make_temp_path("stream_integrity_content"),
+        temp_path: make_temp_path("stream_integrity_temp"),
+        max_concurrent_writes: 1,
+        ..Default::default()
+    })
+    .await?;
+    let key = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    store.update_oneshot(key, VALUE1.into()).await?;
+
+    for value in [VALUE1, VALUE2] {
+        for declared in [
+            UploadSizeInfo::ExactSize(value.len() as u64 + 1),
+            UploadSizeInfo::MaxSize(value.len() as u64 - 1),
+        ] {
+            let (mut tx, rx) = make_buf_channel_pair();
+            let (sent, updated) = tokio::join!(
+                async move {
+                    tx.send(value.into()).await?;
+                    tx.send_eof()
+                },
+                store.update(key, rx, declared)
+            );
+            sent?;
+            assert_eq!(updated.unwrap_err().code, Code::InvalidArgument);
+            assert_eq!(
+                store.get_part_unchunked(key, 0, None).await?,
+                VALUE1.as_bytes()
+            );
+        }
+    }
+    // Rejections must not consume the sole write permit or poison later writes.
+    store.update_oneshot(key, VALUE2.into()).await?;
+    assert_eq!(
+        store.get_part_unchunked(key, 0, None).await?,
+        VALUE2.as_bytes()
+    );
+    Ok(())
+}
+
 #[nativelink_test]
 async fn incomplete_whole_file_does_not_replace_existing_blob() -> Result<(), Error> {
     let temp_path = make_temp_path("whole_file_integrity");
