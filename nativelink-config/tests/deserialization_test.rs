@@ -15,10 +15,9 @@
 use nativelink_config::serde_utils::{
     convert_boolean_with_shellexpand, convert_data_size_with_shellexpand,
     convert_duration_with_shellexpand, convert_duration_with_shellexpand_and_negative,
-    convert_numeric_with_shellexpand,
-    convert_optional_data_size_with_shellexpand, convert_optional_numeric_with_shellexpand,
-    convert_optional_string_with_shellexpand, convert_string_with_shellexpand,
-    convert_vec_string_with_shellexpand,
+    convert_numeric_with_shellexpand, convert_optional_data_size_with_shellexpand,
+    convert_optional_numeric_with_shellexpand, convert_optional_string_with_shellexpand,
+    convert_string_with_shellexpand, convert_vec_string_with_shellexpand,
 };
 use serde::Deserialize;
 
@@ -262,11 +261,10 @@ mod negative_duration_string_tests {
     // negative string must be rejected, not read as zero.
     #[test]
     fn scheduler_timeout_rejects_a_negative_string() {
-        let message = serde_json5::from_str::<SimpleSpec>(
-            r#"{"max_action_executing_timeout_s": "-1s"}"#,
-        )
-        .expect_err("negative timeout")
-        .to_string();
+        let message =
+            serde_json5::from_str::<SimpleSpec>(r#"{"max_action_executing_timeout_s": "-1s"}"#)
+                .expect_err("negative timeout")
+                .to_string();
         assert!(message.contains(NEGATIVE), "{message}");
 
         let spec: SimpleSpec =
