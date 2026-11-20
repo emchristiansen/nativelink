@@ -2213,7 +2213,9 @@ impl WriteTrace {
 
     fn retirement_detail(&self, stage: &'static str) {
         let mut trace_state = self.state.lock();
-        let count = trace_state.retirement_stage.map_or(0, |(_, count, _)| count);
+        let count = trace_state
+            .retirement_stage
+            .map_or(0, |(_, count, _)| count);
         trace_state.retirement_stage = Some((stage, count, Instant::now()));
     }
 
