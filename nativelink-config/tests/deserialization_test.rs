@@ -14,7 +14,8 @@
 
 use nativelink_config::serde_utils::{
     convert_boolean_with_shellexpand, convert_data_size_with_shellexpand,
-    convert_duration_with_shellexpand, convert_numeric_with_shellexpand,
+    convert_duration_with_shellexpand, convert_duration_with_shellexpand_and_negative,
+    convert_numeric_with_shellexpand,
     convert_optional_data_size_with_shellexpand, convert_optional_numeric_with_shellexpand,
     convert_optional_string_with_shellexpand, convert_string_with_shellexpand,
     convert_vec_string_with_shellexpand,
@@ -25,6 +26,12 @@ use serde::Deserialize;
 struct DurationEntity {
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
     duration: usize,
+}
+
+#[derive(Deserialize, Debug)]
+struct SignedDurationEntity {
+    #[serde(deserialize_with = "convert_duration_with_shellexpand_and_negative")]
+    duration: i64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -168,6 +175,117 @@ mod duration_tests {
             let deserialized: DurationEntity = serde_json5::from_str(input).unwrap();
             assert_eq!(deserialized.duration, expected);
         }
+    }
+}
+
+mod negative_duration_string_tests {
+    use nativelink_config::schedulers::SimpleSpec;
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    const NEGATIVE: &str = "Negative duration is not allowed";
+
+    fn unsigned_error(input: &str) -> String {
+        serde_json5::from_str::<DurationEntity>(input)
+            .expect_err(input)
+            .to_string()
+    }
+
+    // A negative duration string is rejected like a negative number, in every
+    // spelling, however small, and never read as zero.
+    #[test]
+    fn unsigned_duration_rejects_negative_strings() {
+        for input in [
+            r#"{"duration": "-1s"}"#,
+            r#"{"duration": "-1h"}"#,
+            r#"{"duration": "-1d"}"#,
+            r#"{"duration": "1s ago"}"#,
+            r#"{"duration": "-PT1S"}"#,
+            r#"{"duration": "-P1D"}"#,
+            r#"{"duration": "-500ms"}"#,
+            r#"{"duration": "-1ns"}"#,
+            r#"{"duration": "  -1m 10s  "}"#,
+        ] {
+            let message = unsigned_error(input);
+            assert!(message.contains(NEGATIVE), "{input}: {message}");
+        }
+    }
+
+    #[test]
+    fn unsigned_duration_rejects_an_environment_expanded_negative_string() {
+        // SAFETY: this variable is used by this test only.
+        unsafe { std::env::set_var("NEGATIVE_DURATION_STRING_TEST", "-30s") };
+        let message = unsigned_error(r#"{"duration": "${NEGATIVE_DURATION_STRING_TEST}"}"#);
+        assert!(message.contains(NEGATIVE), "{message}");
+    }
+
+    #[test]
+    fn unsigned_duration_keeps_zero_and_positive_strings() {
+        for (input, expected) in [
+            (r#"{"duration": "0s"}"#, 0),
+            (r#"{"duration": "-0s"}"#, 0),
+            (r#"{"duration": "PT0S"}"#, 0),
+            (r#"{"duration": "1s"}"#, 1),
+            (r#"{"duration": "PT1S"}"#, 1),
+            (r#"{"duration": "+5m"}"#, 300),
+            (r#"{"duration": "P1D"}"#, 86_400),
+        ] {
+            let deserialized: DurationEntity = serde_json5::from_str(input).expect(input);
+            assert_eq!(deserialized.duration, expected, "{input}");
+        }
+    }
+
+    // The signed helper keeps a negative string's sign, as it does a negative
+    // number's.
+    #[test]
+    fn signed_duration_keeps_the_sign_of_strings() {
+        // SAFETY: this variable is used by this test only.
+        unsafe { std::env::set_var("SIGNED_DURATION_STRING_TEST", "-3s") };
+        for (input, expected) in [
+            (r#"{"duration": -7}"#, -7),
+            (r#"{"duration": "-1s"}"#, -1),
+            (r#"{"duration": "-PT2M"}"#, -120),
+            (r#"{"duration": "2m ago"}"#, -120),
+            (r#"{"duration": "${SIGNED_DURATION_STRING_TEST}"}"#, -3),
+            (r#"{"duration": "0s"}"#, 0),
+            (r#"{"duration": 30}"#, 30),
+            (r#"{"duration": "30s"}"#, 30),
+            (r#"{"duration": "PT30S"}"#, 30),
+        ] {
+            let deserialized: SignedDurationEntity = serde_json5::from_str(input).expect(input);
+            assert_eq!(deserialized.duration, expected, "{input}");
+        }
+    }
+
+    // The consuming setting: zero disables the executing-action timeout, so a
+    // negative string must be rejected, not read as zero.
+    #[test]
+    fn scheduler_timeout_rejects_a_negative_string() {
+        let message = serde_json5::from_str::<SimpleSpec>(
+            r#"{"max_action_executing_timeout_s": "-1s"}"#,
+        )
+        .expect_err("negative timeout")
+        .to_string();
+        assert!(message.contains(NEGATIVE), "{message}");
+
+        let spec: SimpleSpec =
+            serde_json5::from_str(r#"{"max_action_executing_timeout_s": "45s"}"#).unwrap();
+        assert_eq!(spec.max_action_executing_timeout_s, 45);
+        let spec: SimpleSpec =
+            serde_json5::from_str(r#"{"max_action_executing_timeout_s": "0s"}"#).unwrap();
+        assert_eq!(spec.max_action_executing_timeout_s, 0);
+    }
+
+    // A signed scheduler setting, where a negative value means disabled.
+    #[test]
+    fn scheduler_signed_interval_keeps_a_negative_string() {
+        let spec: SimpleSpec =
+            serde_json5::from_str(r#"{"executing_sweep_interval_s": "-1s"}"#).unwrap();
+        assert_eq!(spec.executing_sweep_interval_s, -1);
+        let spec: SimpleSpec =
+            serde_json5::from_str(r#"{"executing_sweep_interval_s": "10s"}"#).unwrap();
+        assert_eq!(spec.executing_sweep_interval_s, 10);
     }
 }
 

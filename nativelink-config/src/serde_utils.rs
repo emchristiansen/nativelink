@@ -366,6 +366,51 @@ where
     deserializer.deserialize_option(DataSizeVisitor::<T>(PhantomData))
 }
 
+/// Which signs a duration string may have.
+#[derive(Clone, Copy)]
+enum Sign {
+    NonNegative,
+    Any,
+}
+
+/// Parses a duration string, after shell expansion, into whole seconds,
+/// rounding ties to even.
+///
+/// The sign is checked on the parsed span, before any conversion: a negative
+/// duration where only non-negative ones are allowed is an error, never a
+/// zero, however small it is. Seconds that do not fit the caller's integer
+/// type are left for the caller's conversion to reject.
+fn duration_str_to_secs<E: de::Error>(v: &str, sign: Sign) -> Result<i128, E> {
+    // 2^127: every whole number of seconds strictly inside it fits an i128.
+    const I128_LIMIT: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+
+    let expanded = shellexpand::env(v).map_err(de::Error::custom)?;
+    let expanded = expanded.as_ref().trim();
+    let duration = expanded.parse::<Span>().map_err(de::Error::custom)?;
+    if matches!(sign, Sign::NonNegative) && duration.is_negative() {
+        return Err(de::Error::custom("Negative duration is not allowed"));
+    }
+    let secs = duration
+        .total(
+            SpanTotal::from(Unit::Second)
+                .days_are_24_hours()
+                .relative(&ZonedDateTime::now()),
+        )
+        .map_err(de::Error::custom)?
+        .round_ties_even();
+    if secs.is_nan() || secs.abs() >= I128_LIMIT {
+        return Err(de::Error::custom(format!(
+            "duration of {secs} seconds is out of range"
+        )));
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "secs is a whole number checked to lie strictly within the i128 range"
+    )]
+    let whole_secs = secs as i128;
+    Ok(whole_secs)
+}
+
 /// # Errors
 ///
 /// Will return `Err` if deserialization fails.
@@ -413,19 +458,9 @@ where
             self.visit_u64(v_u64)
         }
 
-        #[allow(clippy::cast_possible_truncation)]
         fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            let expanded = shellexpand::env(v).map_err(de::Error::custom)?;
-            let expanded = expanded.as_ref().trim();
-            let duration = expanded.parse::<Span>().map_err(de::Error::custom)?;
-            let secs = duration
-                .total(
-                    SpanTotal::from(Unit::Second)
-                        .days_are_24_hours()
-                        .relative(&ZonedDateTime::now()),
-                )
-                .map_err(de::Error::custom)?;
-            self.visit_u64(secs.round_ties_even() as u64)
+            let secs = duration_str_to_secs(v, Sign::NonNegative)?;
+            self.visit_u64(u64::try_from(secs).map_err(de::Error::custom)?)
         }
     }
 
@@ -475,19 +510,9 @@ where
             self.visit_i64(v_i64)
         }
 
-        #[allow(clippy::cast_possible_truncation)]
         fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            let expanded = shellexpand::env(v).map_err(de::Error::custom)?;
-            let expanded = expanded.as_ref().trim();
-            let duration = expanded.parse::<Span>().map_err(de::Error::custom)?;
-            let secs = duration
-                .total(
-                    SpanTotal::from(Unit::Second)
-                        .days_are_24_hours()
-                        .relative(&ZonedDateTime::now()),
-                )
-                .map_err(de::Error::custom)?;
-            self.visit_u64(secs.round_ties_even() as u64)
+            let secs = duration_str_to_secs(v, Sign::Any)?;
+            self.visit_i64(i64::try_from(secs).map_err(de::Error::custom)?)
         }
     }
 
