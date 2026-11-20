@@ -20,6 +20,7 @@ use core::time::Duration;
 use std::borrow::Cow;
 #[cfg(unix)]
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::io::SeekFrom;
 use std::sync::{Arc, Weak};
@@ -35,7 +36,6 @@ use futures::{Future, TryFutureExt};
 use nativelink_config::stores::FilesystemSpec;
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::MetricsComponent;
-use nativelink_util::background_spawn;
 use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair,
 };
@@ -49,6 +49,7 @@ use nativelink_util::store_trait::RemoveItemCallback;
 use nativelink_util::store_trait::{
     RemoveCallback, StoreDriver, StoreKey, StoreKeyBorrow, StoreOptimizations, UploadSizeInfo,
 };
+use nativelink_util::{background_spawn, background_spawn_blocking};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, Take};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
@@ -106,6 +107,154 @@ pub struct SharedContext {
     temp_path: String,
     #[metric(help = "Path to the configured content path")]
     content_path: String,
+    /// Files of retired entries waiting to be deleted. See
+    /// [`SharedContext::retire_file`].
+    retired_files: parking_lot::Mutex<RetiredFiles>,
+    /// Admits one retirement operation of this store at a time. See
+    /// [`SharedContext::retire_blocking`].
+    retirement: Arc<Semaphore>,
+}
+
+/// The files of retired entries that are waiting to be deleted, and whether a
+/// drain task is deleting them.
+#[derive(Debug, Default)]
+struct RetiredFiles {
+    paths: VecDeque<OsString>,
+    draining: bool,
+}
+
+impl SharedContext {
+    fn new(temp_path: String, content_path: String) -> Self {
+        Self {
+            active_drop_spawns: AtomicU64::new(0),
+            temp_path,
+            content_path,
+            retired_files: parking_lot::Mutex::default(),
+            retirement: Arc::new(Semaphore::new(1)),
+        }
+    }
+
+    /// Runs `operation`, a retirement operation of this store, on the
+    /// blocking pool once no other one is running: the rename of an evicted
+    /// entry's file into the temp directory ([`FileEntryImpl::unref`]) or the
+    /// unlink of an evicted digest's executable variant
+    /// ([`ExecutableVariantRemover`]).
+    ///
+    /// The kernel performs one rename between two directories at a time per
+    /// filesystem, and one unlink at a time per directory. Evictions retire
+    /// thousands of entries at once, and several cleanups can overlap (each
+    /// write retires what its insertion displaced after releasing its write
+    /// permit); admitted together, each waiting operation held a
+    /// blocking-pool thread, until none was left for any other file
+    /// operation in the process, while retiring nothing faster. Waiting here
+    /// holds no thread. The admission moves into the blocking closure, so the
+    /// next operation starts only when this one has really finished, even if
+    /// the caller is dropped meanwhile; a closure dropped before it starts
+    /// releases it unrun. It takes no open-file permit: a rename or an unlink
+    /// opens no file, and waiting for one while admitted could hold every
+    /// retirement of the store behind the writers whose files it retires.
+    async fn retire_blocking<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, Error> {
+        let admission = self
+            .retirement
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|err| Error::from_std_err(Code::Internal, &err))?;
+        spawn_blocking!("filesystem_store_retire", move || {
+            let _admission = admission;
+            operation()
+        })
+        .await
+        .map_err(Error::from)
+    }
+
+    /// Deletes the file of a retired entry, in the background.
+    ///
+    /// Retired files are deleted one at a time, in the order they were
+    /// retired, by at most one drain task per store. Nearly all of them are in
+    /// the store's temp directory, which an eviction fills with one file per
+    /// evicted entry (thousands at once), and the kernel performs only one
+    /// unlink at a time in a directory: each holds the directory's inode lock.
+    /// A task per file, as before, put one blocking-pool thread per file to
+    /// sleep on that lock, until no thread was left for any other file
+    /// operation in the process (reads, writes and fsyncs of every store and
+    /// the worker), while deleting no faster than one thread does.
+    fn retire_file(self: &Arc<Self>, file_path: OsString) {
+        let mut retired_files = self.retired_files.lock();
+        retired_files.paths.push_back(file_path);
+        if retired_files.draining {
+            // The running drain takes the file before it can find the queue
+            // empty: both happen under this lock.
+            return;
+        }
+        retired_files.draining = true;
+        drop(retired_files);
+        let drain = RetiredFileDrain {
+            shared_context: self.clone(),
+            finished: false,
+        };
+        background_spawn_blocking!("filesystem_delete_files", move || drain.run());
+    }
+}
+
+/// The one task allowed to delete a store's retired files, while it exists.
+/// Dropping it unfinished (its blocking closure was dropped without running
+/// to the end, e.g. at runtime shutdown) lets the next retired file start a
+/// new drain, which also deletes the files this one left queued.
+struct RetiredFileDrain {
+    shared_context: Arc<SharedContext>,
+    finished: bool,
+}
+
+impl RetiredFileDrain {
+    fn run(mut self) {
+        loop {
+            let file_path = {
+                let mut retired_files = self.shared_context.retired_files.lock();
+                let Some(file_path) = retired_files.paths.pop_front() else {
+                    retired_files.draining = false;
+                    self.finished = true;
+                    return;
+                };
+                file_path
+            };
+            // Deliberately NOT `fs::remove_file`: unlinking opens no file, so
+            // it needs no open-file permit, and waiting for one here could
+            // hold the drain behind the writers whose files it is deleting.
+            match std::fs::remove_file(&file_path) {
+                Ok(()) => debug!(?file_path, "File deleted"),
+                // The file already being gone is the desired end state of a
+                // delete, not a failure — e.g. an entry marked Temp after an
+                // already-gone unref points at a path that was never created.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    debug!(?file_path, "File already gone, nothing to delete");
+                }
+                Err(err) => error!(?file_path, ?err, "Failed to delete file"),
+            }
+            // .fetch_sub returns previous value, so we subtract one to get approximate current value
+            let current_active_drop_spawns = self
+                .shared_context
+                .active_drop_spawns
+                .fetch_sub(1, Ordering::Relaxed)
+                - 1;
+            debug!(
+                ?current_active_drop_spawns,
+                ?file_path,
+                "Dropped a filesystem_delete_file"
+            );
+        }
+    }
+}
+
+impl Drop for RetiredFileDrain {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.shared_context.retired_files.lock().draining = false;
+        }
+    }
 }
 
 #[derive(Eq, PartialEq, Debug)]
@@ -186,9 +335,9 @@ impl Drop for EncodedFilePath {
         }
 
         let file_path = self.get_file_path().to_os_string();
-        let shared_context = self.shared_context.clone();
         // .fetch_add returns previous value, so we add one to get approximate current value
-        let current_active_drop_spawns = shared_context
+        let current_active_drop_spawns = self
+            .shared_context
             .active_drop_spawns
             .fetch_add(1, Ordering::Relaxed)
             + 1;
@@ -197,28 +346,7 @@ impl Drop for EncodedFilePath {
             ?file_path,
             "Spawned a filesystem_delete_file"
         );
-        background_spawn!("filesystem_delete_file", async move {
-            match fs::remove_file(&file_path).await {
-                Ok(()) => debug!(?file_path, "File deleted"),
-                // The file already being gone is the desired end state of a
-                // delete, not a failure — e.g. an entry marked Temp after an
-                // already-gone unref points at a path that was never created.
-                Err(err) if err.code == Code::NotFound => {
-                    debug!(?file_path, "File already gone, nothing to delete");
-                }
-                Err(err) => error!(?file_path, ?err, "Failed to delete file"),
-            }
-            // .fetch_sub returns previous value, so we subtract one to get approximate current value
-            let current_active_drop_spawns = shared_context
-                .active_drop_spawns
-                .fetch_sub(1, Ordering::Relaxed)
-                - 1;
-            debug!(
-                ?current_active_drop_spawns,
-                ?file_path,
-                "Dropped a filesystem_delete_file"
-            );
-        });
+        self.shared_context.retire_file(file_path);
     }
 }
 
@@ -769,17 +897,30 @@ impl LenEntry for FileEntryImpl {
             Version::V2,
         );
 
-        if let Err(err) = fs::rename(&from_path, &to_path).await {
-            // ENOENT from rename is ambiguous: the source may be gone, or
-            // a directory component of the destination (the temp dir) may
-            // be missing. Confirm the source is genuinely gone before
-            // treating it as benign — otherwise a removed temp dir would
-            // flip an intact content file to Temp and orphan it on disk.
-            let source_gone = err.code == Code::NotFound
-                && matches!(
-                    fs::metadata(&from_path).await,
-                    Err(meta_err) if meta_err.code == Code::NotFound
-                );
+        let renamed = encoded_file_path
+            .shared_context
+            .retire_blocking({
+                let (from_path, to_path) = (from_path.to_os_string(), to_path.clone());
+                move || {
+                    std::fs::rename(&from_path, &to_path).map_err(|err| {
+                        // ENOENT from rename is ambiguous: the source may be
+                        // gone, or a directory component of the destination
+                        // (the temp dir) may be missing. Confirm the source is
+                        // genuinely gone before treating it as benign —
+                        // otherwise a removed temp dir would flip an intact
+                        // content file to Temp and orphan it on disk.
+                        let source_gone = err.kind() == std::io::ErrorKind::NotFound
+                            && matches!(
+                                std::fs::metadata(&from_path),
+                                Err(meta_err) if meta_err.kind() == std::io::ErrorKind::NotFound
+                            );
+                        (Error::from(err), source_gone)
+                    })
+                }
+            })
+            .await
+            .unwrap_or_else(|err| Err((err, false)));
+        if let Err((err, source_gone)) = renamed {
             if source_gone {
                 // The file is already gone — typically another thread's
                 // eviction beat us, or the entry never got its file on
@@ -1331,8 +1472,9 @@ enum AfterPublication<Fe> {
 }
 
 impl<Fe: FileEntry> AfterPublication<Fe> {
-    /// Retires the displaced or superseded files. This waits for open-file
-    /// permits (`unref()` renames them into the temp directory).
+    /// Retires the displaced or superseded files. This waits for the store's
+    /// retirement admission (`unref()` renames them into the temp directory;
+    /// see [`SharedContext::retire_blocking`]), never for an open-file permit.
     async fn run(self) {
         match self {
             Self::Inserted(cleanup) => drop(cleanup.run().await),
@@ -1420,14 +1562,51 @@ async fn publish_file<Fe: FileEntry>(
 /// the startup `remove_dir_all`, so it grows without bound at runtime (#2474).
 /// Tying its lifetime to the primary entry instead bounds total disk use to
 /// roughly `2 * max_bytes` in the worst case (every blob also executable).
+///
+/// A variant is named by its digest alone and serves whichever generation of
+/// the digest is resident, while a callback names only the key it was
+/// registered for. A callback can run long after its entry left the map (it
+/// waits for retirement admission behind earlier retirements), by which time
+/// the digest may be resident again with a variant a worker is about to
+/// hardlink. So the callback deletes the variant only when no generation of
+/// the digest is resident, decided under the digest's
+/// [`ExecutableVariantLease`] and held through the unlink:
+///
+/// - Materialization holds the same lease, so the unlink never races a
+///   variant being published.
+/// - Fast-path readers skip a digest whose lease is held
+///   ([`FilesystemStore::variant_leases_held`]). A reader that returns an
+///   existing variant therefore looked before this callback took the lease,
+///   and a caller that keeps the digest resident (a worker leases its inputs)
+///   is still resident when the callback checks, so the variant is kept.
+/// - A resident generation's own removal later retires the variant.
+///
+/// Cancelled before its unlink starts, the callback deletes nothing: the
+/// variant stays until the digest's next removal or the startup wipe, and a
+/// newer generation never loses its variant to it.
 #[cfg(unix)]
 #[derive(Debug)]
-struct ExecutableVariantRemover {
+struct ExecutableVariantRemover<Fe: FileEntry> {
     content_path: String,
+    shared_context: Arc<SharedContext>,
+    executable_locks: Arc<ExecutableLocks>,
+    /// Weak because the map owns this callback.
+    evicting_map: Weak<FsEvictingMap<'static, Fe>>,
+}
+
+/// What an [`ExecutableVariantRemover`] did with a variant.
+#[cfg(unix)]
+#[derive(Debug)]
+enum VariantRetirement {
+    Deleted,
+    /// No variant was ever materialized, or it was already deleted.
+    Absent,
+    /// A generation of the digest is resident again and owns the variant.
+    KeptForResidentGeneration,
 }
 
 #[cfg(unix)]
-impl RemoveItemCallback for ExecutableVariantRemover {
+impl<Fe: FileEntry> RemoveItemCallback for ExecutableVariantRemover<Fe> {
     fn callback<'a>(
         &'a self,
         store_key: StoreKey<'a>,
@@ -1440,13 +1619,44 @@ impl RemoveItemCallback for ExecutableVariantRemover {
                 "{}{EXECUTABLE_DIR_SUFFIX}/{DIGEST_FOLDER_V2}/{digest}",
                 self.content_path
             );
-            match fs::remove_file(&variant_path).await {
-                Ok(()) => debug!(
+            let lease = ExecutableVariantLease::acquire(&self.executable_locks, digest).await;
+            let evicting_map = self.evicting_map.clone();
+            let retired = self
+                .shared_context
+                .retire_blocking({
+                    let variant_path = variant_path.clone();
+                    move || {
+                        // Released only once the unlink has really ended, even
+                        // if this callback is cancelled meanwhile.
+                        let _lease = lease;
+                        let key = StoreKey::Digest(digest);
+                        if evicting_map
+                            .upgrade()
+                            .is_some_and(|map| map.is_resident(&key))
+                        {
+                            return Ok(VariantRetirement::KeptForResidentGeneration);
+                        }
+                        match std::fs::remove_file(&variant_path) {
+                            Ok(()) => Ok(VariantRetirement::Deleted),
+                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                                Ok(VariantRetirement::Absent)
+                            }
+                            Err(err) => Err(Error::from(err)),
+                        }
+                    }
+                })
+                .await
+                .and_then(|retired| retired);
+            match retired {
+                Ok(VariantRetirement::Deleted) => debug!(
                     ?variant_path,
                     "Deleted executable variant for evicted digest"
                 ),
-                // Common case: no variant was ever materialized for this digest.
-                Err(err) if err.code == Code::NotFound => {}
+                Ok(VariantRetirement::Absent) => {}
+                Ok(VariantRetirement::KeptForResidentGeneration) => debug!(
+                    ?variant_path,
+                    "Kept executable variant of a digest that is resident again"
+                ),
                 Err(err) => warn!(
                     ?variant_path,
                     ?err,
@@ -1503,7 +1713,9 @@ pub struct FilesystemStore<Fe: FileEntry = FileEntryImpl> {
 #[cfg(unix)]
 type ExecutableLocks = std::sync::Mutex<HashMap<DigestInfo, Arc<Mutex<()>>>>;
 
-/// Exclusive right to materialize one digest's executable variant.
+/// Exclusive right to materialize or delete one digest's executable variant.
+/// Materialization and [`ExecutableVariantRemover`] both hold it, and readers
+/// that skip it check that no one holds it ([`FilesystemStore::variant_leases_held`]).
 ///
 /// A lease holds the digest's lock *and* that lock is still the digest's
 /// entry in [`ExecutableLocks`]. Only a lease removes the entry, when it is
@@ -1518,9 +1730,9 @@ type ExecutableLocks = std::sync::Mutex<HashMap<DigestInfo, Arc<Mutex<()>>>>;
 /// it first, whose lease then retires the entry. Cancelling a queued caller
 /// only drops its claim on the lock.
 ///
-/// The lease moves into the blocking task that does the copy. That task runs
-/// to completion even when its caller is cancelled, and the lease is released
-/// only when the task — the actual writer — has finished.
+/// The lease moves into the blocking task that does the copy or the unlink.
+/// That task runs to completion even when its caller is cancelled, and the
+/// lease is released only when the task — the actual writer — has finished.
 #[cfg(unix)]
 struct ExecutableVariantLease {
     locks: Arc<ExecutableLocks>,
@@ -1683,6 +1895,13 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         // ordinary CAS reads remain enabled but executable variants do not.
         // Unix-only: the executable bit (and the ETXTBSY race it guards
         // against) does not apply on Windows.
+        let shared_context = Arc::new(SharedContext::new(
+            spec.temp_path.clone(),
+            spec.content_path.clone(),
+        ));
+        #[cfg(unix)]
+        let executable_locks = Arc::<ExecutableLocks>::default();
+
         #[cfg(unix)]
         let executable_variants_enabled = {
             let enabled = prepare_executable_dir(&spec.content_path).await?;
@@ -1699,17 +1918,14 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
                 evicting_map.add_remove_callback(RemoveCallbackHolder::new(Arc::new(
                     ExecutableVariantRemover {
                         content_path: spec.content_path.clone(),
+                        shared_context: shared_context.clone(),
+                        executable_locks: executable_locks.clone(),
+                        evicting_map: Arc::downgrade(&evicting_map),
                     },
                 )));
             }
             enabled
         };
-
-        let shared_context = Arc::new(SharedContext {
-            active_drop_spawns: AtomicU64::new(0),
-            temp_path: spec.temp_path.clone(),
-            content_path: spec.content_path.clone(),
-        });
 
         let block_size = if spec.block_size == 0 {
             DEFAULT_BLOCK_SIZE
@@ -1764,7 +1980,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             #[cfg(target_os = "macos")]
             flush_coalescer,
             #[cfg(unix)]
-            executable_locks: Arc::default(),
+            executable_locks,
             #[cfg(unix)]
             executable_variants_enabled,
         }))
@@ -1869,14 +2085,32 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             .await
     }
 
+    /// Whether someone holds each digest's [`ExecutableVariantLease`], that
+    /// is, may be materializing or deleting its variant. A reader that finds an
+    /// existing variant may return it without the lease only if it saw the
+    /// lease free *before* looking at the file: see [`ExecutableVariantRemover`].
+    #[cfg(unix)]
+    fn variant_leases_held(&self, digests: &[DigestInfo]) -> Vec<bool> {
+        let locks = self
+            .executable_locks
+            .lock()
+            .expect("executable_locks poisoned");
+        digests
+            .iter()
+            .map(|digest| locks.contains_key(digest))
+            .collect()
+    }
+
     /// Reports which digests already have an executable variant on disk, in one
-    /// batched existence check.
+    /// batched existence check. A digest whose lease is held counts as a miss,
+    /// so it takes the per-digest path and waits for the lease.
     #[cfg(unix)]
     async fn materialized_variants(&self, digests: &[DigestInfo]) -> Vec<Option<OsString>> {
         let paths: Vec<OsString> = digests
             .iter()
             .map(|digest| self.executable_variant_path(digest))
             .collect();
+        let leases_held = self.variant_leases_held(digests);
 
         // Variants disabled and a failed batch are the same situation: nothing
         // is known to exist, so every digest takes the per-digest path, which
@@ -1893,7 +2127,8 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         paths
             .into_iter()
             .zip(exists)
-            .map(|(path, hit)| hit.then_some(path))
+            .zip(leases_held)
+            .map(|((path, hit), held)| (hit && !held).then_some(path))
             .collect()
     }
 
@@ -1934,10 +2169,22 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         let variant_path = self.executable_variant_path(digest);
 
         // Fast path: the variant already exists, so the caller can hardlink it
-        // with no writable fd anywhere in sight.
-        if fs::metadata(&variant_path).await.is_ok() {
+        // with no writable fd anywhere in sight. Unless someone holds the
+        // lease, which may mean a removal is about to delete the file.
+        if !self.variant_leases_held(core::slice::from_ref(digest))[0]
+            && fs::metadata(&variant_path).await.is_ok()
+        {
             return Ok(variant_path);
         }
+
+        // Resolve the on-disk CAS blob (0o444) to copy from before taking the
+        // lease: resolving may reap an expired entry, whose removal callback
+        // takes this digest's lease. Must be present in this tier; callers
+        // populate the fast store first.
+        let file_entry = self
+            .get_file_entry_for_digest(digest)
+            .await
+            .err_tip(|| "Resolving CAS blob for executable variant")?;
 
         // Single-flight: exactly one task ever opens a writable fd for this
         // variant. Without this, a cold-cache burst of concurrent actions
@@ -1945,29 +2192,27 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         // ETXTBSY exploits.
         let lease = ExecutableVariantLease::acquire(&self.executable_locks, *digest).await;
 
-        // Re-check: another task may have constructed it while we waited.
+        // Re-check: another task may have constructed it while we waited, and
+        // no removal can be deleting it while we hold the lease.
         if fs::metadata(&variant_path).await.is_ok() {
             return Ok(variant_path);
         }
 
         let result = self
-            .create_executable_variant(digest, &variant_path, lease)
+            .create_executable_variant(&file_entry, &variant_path, lease)
             .await;
 
-        // The digest may have been evicted mid-copy: its eviction callback ran
-        // before the rename published the variant, so nothing owns the file
-        // anymore. This orphans the variant from eviction accounting, but the
-        // race is rare enough (needs an eviction to land in the narrow window
-        // between rename and this check, on a digest's first-ever variant
-        // materialization) that it's a self-limiting leak, not a systemic one
-        // — cheaper to log and let this action succeed with the still-valid
-        // file than to fail an otherwise-successful action over it.
+        // The digest may have been removed mid-copy. Its removal callback then
+        // deletes the variant once this copy releases the lease, or, if it ran
+        // before the copy took the lease, left nothing to delete and this
+        // variant is untracked until the digest's next removal. A caller that
+        // keeps its inputs leased cannot see either: leased entries are not
+        // evicted.
         if result.is_ok() && self.evicting_map.get(&digest.into()).await.is_none() {
             warn!(
                 %digest,
                 ?variant_path,
-                "Digest evicted while materializing its executable variant; \
-                 variant is now untracked by eviction accounting"
+                "Digest removed while materializing its executable variant"
             );
         }
 
@@ -1987,21 +2232,15 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             .await
     }
 
-    /// Materializes the 0o555 executable variant for `digest`, under `lease`,
-    /// which the blocking copy holds until it has finished.
+    /// Materializes the 0o555 executable variant of `file_entry`'s blob, under
+    /// `lease`, which the blocking copy holds until it has finished.
     #[cfg(unix)]
     async fn create_executable_variant(
         &self,
-        digest: &DigestInfo,
+        file_entry: &Fe,
         variant_path: &OsStr,
         lease: ExecutableVariantLease,
     ) -> Result<(), Error> {
-        // Resolve the on-disk CAS blob (0o444) to copy from. Must be present in
-        // this tier; callers populate the fast store first.
-        let file_entry = self
-            .get_file_entry_for_digest(digest)
-            .await
-            .err_tip(|| "Resolving CAS blob for executable variant")?;
         let src_path = file_entry
             .get_file_path_locked(|p| async move { Ok(p) })
             .await?;
@@ -2351,6 +2590,29 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     // Only for tests, so we can run check_duplicate_files
     pub fn get_evicting_map(&self) -> Arc<FsEvictingMap<'static, Fe>> {
         self.evicting_map.clone()
+    }
+
+    /// Takes this store's retirement admission (see
+    /// [`SharedContext::retire_blocking`]) until the permit is dropped, so a
+    /// test can stand in for a slow earlier retirement without making one.
+    pub async fn hold_retirement_admission_for_test(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.shared_context
+            .retirement
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("retirement admission is never closed")
+    }
+
+    /// Callers holding or queued for `digest`'s executable-variant lease, so a
+    /// test can tell when a caller is waiting behind another.
+    #[cfg(unix)]
+    pub fn executable_variant_lease_claims_for_test(&self, digest: &DigestInfo) -> usize {
+        self.executable_locks
+            .lock()
+            .expect("executable_locks poisoned")
+            .get(digest)
+            .map_or(0, |lock| Arc::strong_count(lock) - 1)
     }
 
     /// Returns the number of device-wide durability barriers issued by this
@@ -2772,5 +3034,77 @@ mod executable_variant_lease_tests {
             drop(last);
             assert!(locks.lock().unwrap().is_empty(), "every lease retired");
         });
+    }
+}
+
+#[cfg(test)]
+mod retirement_admission_tests {
+    use core::time::Duration;
+    use std::sync::Arc;
+
+    use nativelink_error::Error;
+    use nativelink_macro::nativelink_test;
+    use nativelink_util::background_spawn;
+    use tokio::sync::oneshot;
+
+    use super::SharedContext;
+
+    /// A retirement operation that has started keeps the store's admission
+    /// after its caller is cancelled, until the operation itself returns, so
+    /// a cancelled caller never lets a second operation run alongside it.
+    /// Adapted from the independent review's probe (`t_d05da3eb`, run7610).
+    #[nativelink_test]
+    async fn started_retirement_keeps_admission_after_caller_abort() -> Result<(), Error> {
+        let ctx = Arc::new(SharedContext::new(String::new(), String::new()));
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let first = background_spawn!("first_retirement", {
+            let ctx = ctx.clone();
+            async move {
+                ctx.retire_blocking(move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .expect("the first operation never started")
+            .unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            ctx.retirement.available_permits(),
+            0,
+            "the started operation keeps admission"
+        );
+
+        let (second_tx, mut second_rx) = oneshot::channel();
+        let second = background_spawn!("second_retirement", {
+            let ctx = ctx.clone();
+            async move {
+                ctx.retire_blocking(move || second_tx.send(()).unwrap())
+                    .await
+            }
+        });
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            matches!(
+                second_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "a second operation ran while the first was still running"
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), second_rx)
+            .await
+            .expect("the second operation never ran")
+            .unwrap();
+        second.await.unwrap()?;
+        assert_eq!(ctx.retirement.available_permits(), 1);
+        Ok(())
     }
 }

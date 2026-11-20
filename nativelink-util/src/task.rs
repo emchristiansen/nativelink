@@ -86,6 +86,15 @@ macro_rules! spawn {
     }};
 }
 
+/// Runs a blocking closure on the blocking pool without waiting for it: unlike
+/// [`spawn_blocking!`], dropping the returned handle does not abort the
+/// closure. If the runtime shuts down before the closure starts, it is dropped
+/// without running, so anything it must release has to be released by `Drop`.
+#[macro_export]
+macro_rules! background_spawn_blocking {
+    ($name:expr, $fut:expr) => {{ $crate::task::__spawn_blocking($fut, $crate::task::__error_span!($name)) }};
+}
+
 #[macro_export]
 macro_rules! spawn_blocking {
     ($name:expr, $fut:expr) => {{

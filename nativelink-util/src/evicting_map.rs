@@ -23,8 +23,6 @@ use core::pin::Pin;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock};
 
-use futures::StreamExt;
-use futures::stream::FuturesUnordered;
 use lru::LruCache;
 use nativelink_config::stores::EvictionPolicy;
 use nativelink_metric::MetricsComponent;
@@ -160,6 +158,30 @@ struct State<
 
 type RemoveFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
+// The remove callbacks and `unref()`s of entries that left the map run one at
+// a time: `run_removal_callbacks`, then `unref_all`. They are where a store
+// retires an entry's resources, and for a filesystem store that is blocking
+// file work the kernel serializes anyway: `unref()` renames the entry's file
+// into the temp directory, and the kernel performs one rename between two
+// directories at a time per filesystem; its executable-variant callback
+// unlinks a file, and the kernel performs one unlink at a time per directory.
+// An eviction retires thousands of entries at once. Running their cleanup
+// concurrently, as before, retired them no faster, but each waiting rename or
+// unlink held a blocking-pool thread until the eviction had taken every one,
+// stalling every other file operation in the process (reads, writes, fsyncs)
+// behind it.
+async fn run_removal_callbacks(removal_futures: Vec<RemoveFuture>) {
+    for removal_future in removal_futures {
+        removal_future.await;
+    }
+}
+
+async fn unref_all<T: LenEntry + Sync>(items: &[T]) {
+    for item in items {
+        item.unref().await;
+    }
+}
+
 /// The cleanup an insertion owes the entries it replaced or evicted: their
 /// remove callbacks, then their `unref()`. See
 /// [`EvictingMap::insert_if_deferring_cleanup`].
@@ -189,21 +211,13 @@ impl<T> Debug for InsertCleanup<T> {
 
 impl<T: LenEntry + Send + Sync> InsertCleanup<T> {
     /// Runs the remove callbacks, then unrefs the displaced entries outside
-    /// the map lock. Returns one of the displaced entries (the first whose
-    /// `unref()` completes), or `None` if the insertion displaced nothing.
+    /// the map lock, one at a time. Returns the first displaced entry (the one
+    /// the insertion replaced, if any), or `None` if the insertion displaced
+    /// nothing.
     pub async fn run(self) -> Option<T> {
-        let mut futures: FuturesUnordered<_> = self.removal_futures.into_iter().collect();
-        while futures.next().await.is_some() {}
-
-        let futures: FuturesUnordered<_> = self
-            .items_to_unref
-            .into_iter()
-            .map(|item| async move {
-                item.unref().await;
-                item
-            })
-            .collect();
-        futures.collect::<Vec<_>>().await.into_iter().next()
+        run_removal_callbacks(self.removal_futures).await;
+        unref_all(&self.items_to_unref).await;
+        self.items_to_unref.into_iter().next()
     }
 }
 
@@ -745,11 +759,8 @@ where
 
         // Perform the async callbacks outside of the lock
         self.flush_cache_size_metrics();
-        let mut callbacks: FuturesUnordered<_> = removal_futures.into_iter().collect();
-        while callbacks.next().await.is_some() {}
-        let mut callbacks: FuturesUnordered<_> =
-            data_to_unref.iter().map(LenEntry::unref).collect();
-        while callbacks.next().await.is_some() {}
+        run_removal_callbacks(removal_futures).await;
+        unref_all(&data_to_unref).await;
     }
 
     /// Fires the registered remove callbacks for `key` without touching the map.
@@ -760,7 +771,7 @@ where
     /// the map (there is nothing to remove). A no-op when no callbacks are
     /// registered.
     pub async fn fire_remove_callbacks(&self, key: &Q) {
-        let mut callbacks: FuturesUnordered<_> = {
+        let callbacks: Vec<_> = {
             let state = self.state.lock();
             state
                 .remove_callbacks
@@ -768,7 +779,15 @@ where
                 .map(|callback| callback.callback(key))
                 .collect()
         };
-        while callbacks.next().await.is_some() {}
+        run_removal_callbacks(callbacks).await;
+    }
+
+    /// Reports whether `key` has an entry, expired or not, without promoting
+    /// it, refreshing its age or reaping it. Unlike [`Self::get`], it never
+    /// runs remove callbacks or unrefs anything, so a remove callback may call
+    /// it while holding a lock that its own callback would take.
+    pub fn is_resident(&self, key: &Q) -> bool {
+        self.state.lock().lru.peek(key).is_some()
     }
 
     /// Returns the value for `key` if present and not expired, refreshing
@@ -807,8 +826,7 @@ where
 
         // Drain remove_callbacks and unref the reaped entry outside the lock.
         self.flush_cache_size_metrics();
-        let mut callbacks: FuturesUnordered<_> = removal_futures.into_iter().collect();
-        while callbacks.next().await.is_some() {}
+        run_removal_callbacks(removal_futures).await;
         if let Some(d) = expired_data {
             d.unref().await;
         }
@@ -935,19 +953,11 @@ where
         };
 
         self.flush_cache_size_metrics();
-        let mut futures: FuturesUnordered<_> = removal_futures.into_iter().collect();
-        while futures.next().await.is_some() {}
+        run_removal_callbacks(removal_futures).await;
 
         // Unref items outside of lock
+        unref_all(&items_to_unref).await;
         items_to_unref
-            .into_iter()
-            .map(|item| async move {
-                item.unref().await;
-                item
-            })
-            .collect::<FuturesUnordered<_>>()
-            .collect::<Vec<_>>()
-            .await
     }
 
     /// Lease a key so automatic size, count, and expiry eviction cannot remove it.
@@ -997,11 +1007,8 @@ where
         };
 
         self.flush_cache_size_metrics();
-        let mut futures: FuturesUnordered<_> = removal_futures.into_iter().collect();
-        while futures.next().await.is_some() {}
-
-        let mut futures: FuturesUnordered<_> = items_to_unref.iter().map(LenEntry::unref).collect();
-        while futures.next().await.is_some() {}
+        run_removal_callbacks(removal_futures).await;
+        unref_all(&items_to_unref).await;
     }
 
     fn inner_insert_many<It>(
@@ -1067,13 +1074,10 @@ where
         };
 
         self.flush_cache_size_metrics();
-        let mut callbacks: FuturesUnordered<_> = removal_futures.into_iter().collect();
-        while callbacks.next().await.is_some() {}
+        run_removal_callbacks(removal_futures).await;
 
         // Unref evicted items outside of lock
-        let mut callbacks: FuturesUnordered<_> =
-            items_to_unref.iter().map(LenEntry::unref).collect();
-        while callbacks.next().await.is_some() {}
+        unref_all(&items_to_unref).await;
 
         // Unref removed item if any
         if let Some(item) = removed_item {
@@ -1118,13 +1122,10 @@ where
 
         // Perform the async callbacks outside of the lock
         self.flush_cache_size_metrics();
-        let mut removal_futures: FuturesUnordered<_> = removal_futures.into_iter().collect();
-        while removal_futures.next().await.is_some() {}
+        run_removal_callbacks(removal_futures).await;
 
         // Unref evicted items
-        let mut callbacks: FuturesUnordered<_> =
-            evicted_items.iter().map(LenEntry::unref).collect();
-        while callbacks.next().await.is_some() {}
+        unref_all(&evicted_items).await;
 
         // Unref removed item if any
         if let Some(item) = removed_item {

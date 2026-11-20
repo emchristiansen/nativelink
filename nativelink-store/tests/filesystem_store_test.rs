@@ -14,7 +14,7 @@
 
 use core::fmt::{Debug, Formatter};
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
@@ -2496,6 +2496,204 @@ async fn orphaned_executable_variant_is_a_miss() -> Result<(), Error> {
     Ok(())
 }
 
+/// Waits until `store`'s map has no entries: a removal has taken its entry
+/// out, and its callbacks may still be waiting.
+#[cfg(target_family = "unix")]
+async fn wait_until_map_empty(store: &FilesystemStore<FileEntryImpl>) -> Result<(), Error> {
+    let evicting_map = store.get_evicting_map();
+    tokio::time::timeout(TASK_JOIN_LIMIT, async {
+        while evicting_map.len_for_test() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        make_err!(
+            Code::DeadlineExceeded,
+            "the removal never took its entry out"
+        )
+    })
+}
+
+/// Starts removing `digest`'s only generation while an earlier retirement
+/// holds the store's retirement admission, and returns once the entry is out
+/// of the map: its executable-variant cleanup is now waiting for admission.
+#[cfg(target_family = "unix")]
+async fn start_delayed_removal(
+    store: &Arc<FilesystemStore<FileEntryImpl>>,
+    digest: DigestInfo,
+) -> Result<
+    (
+        tokio::sync::OwnedSemaphorePermit,
+        tokio::task::JoinHandle<bool>,
+    ),
+    Error,
+> {
+    let admission = store.hold_retirement_admission_for_test().await;
+    let removal = background_spawn!("delayed_removal", {
+        let evicting_map = store.get_evicting_map();
+        async move { evicting_map.remove(&StoreKey::Digest(digest)).await }
+    });
+    wait_until_map_empty(store).await?;
+    assert!(
+        !removal.is_finished(),
+        "the removal's cleanup must be waiting"
+    );
+    Ok((admission, removal))
+}
+
+/// Hardlinks `variant` the way a worker materializes an executable input, and
+/// checks the link's bytes and mode.
+#[cfg(target_family = "unix")]
+async fn hardlink_executable_input(variant: &OsStr, input: &str) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::hard_link(variant, input).err_tip(|| "Hardlinking the executable variant")?;
+    assert_eq!(
+        read_file_contents(OsStr::new(input)).await?,
+        VALUE1.as_bytes()
+    );
+    let mode = std::fs::metadata(input)?.permissions().mode();
+    assert_eq!(mode & 0o777, 0o555, "executable input must be 0o555");
+    Ok(())
+}
+
+/// A removal's variant cleanup can wait for retirement admission long after
+/// its entry left the map. Meanwhile a worker may lease the digest, upload it
+/// again and resolve its executable variant (creating one, or finding one the
+/// old generation left). The old cleanup must not delete the variant the
+/// resident, leased generation's worker is about to hardlink.
+#[cfg(target_family = "unix")]
+async fn check_delayed_old_removal_keeps_new_generations_variant(
+    old_generation_had_variant: bool,
+) -> Result<(), Error> {
+    let content_path = make_temp_path("content_path");
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: content_path.clone(),
+        temp_path: make_temp_path("temp_path"),
+        ..Default::default()
+    })
+    .await?;
+    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    store.update_oneshot(digest, VALUE1.into()).await?;
+    if old_generation_had_variant {
+        store.get_executable_hardlink_source(&digest).await?;
+    }
+    let (admission, removal) = start_delayed_removal(&store, digest).await?;
+
+    store.lease_digest(&digest);
+    store.update_oneshot(digest, VALUE1.into()).await?;
+    let resolve = background_spawn!("resolve_new_generations_variant", {
+        let store = store.clone();
+        async move { store.get_executable_hardlink_source(&digest).await }
+    });
+    // Admit the old cleanup only once the worker has resolved its variant, or
+    // is queued for the variant lease behind someone holding it (the old
+    // cleanup is the only other claimant).
+    tokio::time::timeout(TASK_JOIN_LIMIT, async {
+        while !resolve.is_finished() && store.executable_variant_lease_claims_for_test(&digest) < 2
+        {
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the worker neither resolved its variant nor queued for it");
+    drop(admission);
+    assert!(join_bounded(removal).await);
+    let variant = join_bounded(resolve).await?;
+
+    assert!(
+        store
+            .get_evicting_map()
+            .is_resident(&StoreKey::Digest(digest)),
+        "the new, leased generation stays resident"
+    );
+    hardlink_executable_input(&variant, &format!("{content_path}-input")).await?;
+    store.release_digests(&[digest]).await;
+    Ok(())
+}
+
+#[cfg(target_family = "unix")]
+#[nativelink_test]
+async fn delayed_old_removal_keeps_variant_created_for_new_generation() -> Result<(), Error> {
+    check_delayed_old_removal_keeps_new_generations_variant(false).await
+}
+
+#[cfg(target_family = "unix")]
+#[nativelink_test]
+async fn delayed_old_removal_keeps_variant_reused_by_new_generation() -> Result<(), Error> {
+    check_delayed_old_removal_keeps_new_generations_variant(true).await
+}
+
+/// A variant whose digest is not resident again when its delayed cleanup is
+/// admitted is still deleted.
+#[cfg(target_family = "unix")]
+#[nativelink_test]
+async fn delayed_removal_deletes_variant_of_digest_not_resident() -> Result<(), Error> {
+    let content_path = make_temp_path("content_path");
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: content_path.clone(),
+        temp_path: make_temp_path("temp_path"),
+        ..Default::default()
+    })
+    .await?;
+    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    store.update_oneshot(digest, VALUE1.into()).await?;
+    let variant = store.get_executable_hardlink_source(&digest).await?;
+    let (admission, removal) = start_delayed_removal(&store, digest).await?;
+    drop(admission);
+    assert!(join_bounded(removal).await);
+    assert!(
+        !Path::new(&variant).exists(),
+        "the variant of a digest no longer resident must be deleted"
+    );
+    assert_eq!(executable_dir_entries(&content_path)?, Vec::<String>::new());
+    Ok(())
+}
+
+/// Cancelling a removal while its variant cleanup waits for admission deletes
+/// nothing and leaves the digest's variant lease free: a later generation
+/// resolves the variant at once, and that generation's removal deletes it.
+#[cfg(target_family = "unix")]
+#[nativelink_test]
+async fn cancelled_delayed_removal_leaves_variant_lease_free() -> Result<(), Error> {
+    let content_path = make_temp_path("content_path");
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: content_path.clone(),
+        temp_path: make_temp_path("temp_path"),
+        ..Default::default()
+    })
+    .await?;
+    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    store.update_oneshot(digest, VALUE1.into()).await?;
+    let variant = store.get_executable_hardlink_source(&digest).await?;
+    let (admission, removal) = start_delayed_removal(&store, digest).await?;
+    removal.abort();
+    let cancelled = tokio::time::timeout(TASK_JOIN_LIMIT, removal)
+        .await
+        .expect("cancelled removal did not finish within TASK_JOIN_LIMIT");
+    assert!(cancelled.is_err_and(|e| e.is_cancelled()));
+    drop(admission);
+
+    store.update_oneshot(digest, VALUE1.into()).await?;
+    let resolved = tokio::time::timeout(
+        Duration::from_secs(2),
+        store.get_executable_hardlink_source(&digest),
+    )
+    .await
+    .expect("the cancelled cleanup must not leave the variant lease held")?;
+    assert_eq!(resolved, variant);
+    hardlink_executable_input(&resolved, &format!("{content_path}-input")).await?;
+
+    assert!(
+        store
+            .get_evicting_map()
+            .remove(&StoreKey::Digest(digest))
+            .await
+    );
+    assert!(!Path::new(&variant).exists());
+    Ok(())
+}
+
 /// This test simulates a full disk without needing one. It writes past the `RLIMIT_FSIZE`
 /// cap, thus failing with `EFBIG`, which tokio defers exactly like `ENOSPC`. The
 /// [`SIGXFSZ`](`libc::SIGXFSZ`) signal must be ignored or the kernel will kill the process
@@ -4098,4 +4296,288 @@ async fn cancelled_upload_still_retires_stale_entry() -> Result<(), Error> {
     assert!(!content_file_exists(&content_path, &digest.into()).await?);
     assert_eq!(store.get_evicting_map().len_for_test(), 0);
     Ok(())
+}
+
+/// An eviction retires its entries one at a time. Each `unref()` renames the
+/// entry's file into the temp directory, and the kernel performs one rename
+/// between two directories at a time per filesystem: unrefs run together (as
+/// they did) retire nothing faster, but each held a blocking-pool thread, so
+/// one eviction could take every thread from the process's other file work.
+#[nativelink_test]
+async fn eviction_unrefs_entries_one_at_a_time() -> Result<(), Error> {
+    const EVICTED_ENTRIES: u64 = 32;
+    static UNREFS_IN_PROGRESS: AtomicU64 = AtomicU64::new(0);
+    static PEAK_UNREFS_IN_PROGRESS: AtomicU64 = AtomicU64::new(0);
+    static UNREFS_FINISHED: AtomicU64 = AtomicU64::new(0);
+
+    struct LocalHooks {}
+    impl FileEntryHooks for LocalHooks {
+        async fn on_unref_async<Fe: FileEntry>(_entry: &Fe) {
+            let in_progress = UNREFS_IN_PROGRESS.fetch_add(1, Ordering::SeqCst) + 1;
+            PEAK_UNREFS_IN_PROGRESS.fetch_max(in_progress, Ordering::SeqCst);
+            // Waiting, as a rename waits for its blocking-pool thread, lets
+            // any unref started together with this one start too.
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            UNREFS_IN_PROGRESS.fetch_sub(1, Ordering::SeqCst);
+            UNREFS_FINISHED.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let content_path = make_temp_path("content_path");
+    let temp_path = make_temp_path("temp_path");
+    let store = Box::pin(
+        FilesystemStore::<TestFileEntry<LocalHooks>>::new(&FilesystemSpec {
+            content_path: content_path.clone(),
+            temp_path: temp_path.clone(),
+            eviction_policy: Some(EvictionPolicy {
+                // The small entries (1 byte each) plus the big one (40 bytes)
+                // exceed 41 bytes until every small entry is evicted.
+                max_bytes: 41,
+                ..Default::default()
+            }),
+            block_size: 1,
+            ..Default::default()
+        })
+        .await?,
+    );
+    for i in 0..EVICTED_ENTRIES {
+        let digest = DigestInfo::try_new(&format!("{i:064x}"), 1)?;
+        store
+            .update_oneshot(digest, Bytes::from_static(b"x"))
+            .await?;
+    }
+    assert_eq!(UNREFS_FINISHED.load(Ordering::SeqCst), 0);
+
+    let big_digest = DigestInfo::try_new(HASH1, 40)?;
+    store
+        .update_oneshot(big_digest, Bytes::from(vec![b'y'; 40]))
+        .await?;
+
+    assert_eq!(UNREFS_FINISHED.load(Ordering::SeqCst), EVICTED_ENTRIES);
+    assert_eq!(
+        PEAK_UNREFS_IN_PROGRESS.load(Ordering::SeqCst),
+        1,
+        "an eviction must unref its entries one at a time",
+    );
+    assert!(store.has(big_digest).await?.is_some());
+    // Every evicted file was renamed into the temp directory and deleted.
+    check_storage_dir_empty(&temp_path).await
+}
+
+/// Builds a current-thread runtime that counts the blocking-pool threads it
+/// starts (its only threads besides the caller's).
+fn runtime_counting_blocking_threads(
+    started: &'static AtomicU64,
+) -> Result<tokio::runtime::Runtime, Error> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test needs to observe the blocking pool's threads"
+    )]
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .on_thread_start(move || {
+            started.fetch_add(1, Ordering::SeqCst);
+        })
+        .build()?;
+    Ok(runtime)
+}
+
+/// Makes `count` temp-file entries, as a write in progress has before its
+/// file is published. Dropping one retires it: its file is deleted.
+async fn make_retirable_entries(
+    store: &FilesystemStore<FileEntryImpl>,
+    count: u64,
+) -> Result<Vec<FileEntryImpl>, Error> {
+    let mut entries = Vec::new();
+    for i in 0..count {
+        let key = StoreKey::Digest(DigestInfo::try_new(&format!("{i:064x}"), 1)?);
+        let (entry, file, _path) = store.make_temp_file(make_temp_key(&key)).await?;
+        drop(file);
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+async fn wait_until_retired_files_deleted(
+    shared_context: &nativelink_store::filesystem_store::SharedContext,
+) -> Result<(), Error> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while shared_context.active_drop_spawns.load(Ordering::Acquire) > 0 {
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .map_err(|_| make_err!(Code::DeadlineExceeded, "retired files were not deleted"))
+}
+
+/// The files of entries retired together (an eviction retires thousands)
+/// are deleted one at a time from one blocking-pool thread. Nearly all are in
+/// the temp directory, where the kernel performs one unlink at a time: a task
+/// per file (as before) deleted them no faster, but put one blocking thread
+/// per file to sleep on the directory's lock until none was left for any
+/// other file operation in the process. A file already gone is counted as
+/// deleted.
+#[test]
+fn retired_files_are_deleted_from_one_blocking_thread() -> Result<(), Error> {
+    const RETIRED_FILES: u64 = 256;
+    static BLOCKING_THREADS_STARTED: AtomicU64 = AtomicU64::new(0);
+    let runtime = runtime_counting_blocking_threads(&BLOCKING_THREADS_STARTED)?;
+    #[expect(clippy::disallowed_methods, reason = "test drives its own runtime")]
+    runtime.block_on(async {
+        let temp_path = make_temp_path("temp_path");
+        let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+            content_path: make_temp_path("content_path"),
+            temp_path: temp_path.clone(),
+            ..Default::default()
+        })
+        .await?;
+        let mut entries = make_retirable_entries(&store, RETIRED_FILES).await?;
+        let shared_context = entries[0].get_shared_context_for_test();
+        let gone = entries[0]
+            .get_file_path_locked(|path| async move { Ok(path) })
+            .await?;
+        fs::remove_file(&gone).await?;
+
+        let started_before = BLOCKING_THREADS_STARTED.load(Ordering::SeqCst);
+        drop(entries);
+        wait_until_retired_files_deleted(&shared_context).await?;
+        let started = BLOCKING_THREADS_STARTED.load(Ordering::SeqCst) - started_before;
+        assert!(
+            started <= 1,
+            "deleting {RETIRED_FILES} retired files started {started} blocking threads",
+        );
+        check_storage_dir_empty(&temp_path).await
+    })
+}
+
+/// A drain that never ran (its runtime shut down before the blocking pool
+/// started it) must not stop later retirements from deleting files: the next
+/// one starts a new drain, which deletes the files the lost drain left too.
+#[test]
+fn retirement_after_a_lost_drain_deletes_the_files_it_left() -> Result<(), Error> {
+    static UNUSED_THREADS_STARTED: AtomicU64 = AtomicU64::new(0);
+    let first_runtime = runtime_counting_blocking_threads(&UNUSED_THREADS_STARTED)?;
+    let temp_path = make_temp_path("temp_path");
+    #[expect(clippy::disallowed_methods, reason = "test drives its own runtime")]
+    let (store, mut entries) = first_runtime.block_on(async {
+        let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+            content_path: make_temp_path("content_path"),
+            temp_path: temp_path.clone(),
+            ..Default::default()
+        })
+        .await?;
+        let entries = make_retirable_entries(&store, 2).await?;
+        Ok::<_, Error>((store, entries))
+    })?;
+    let shared_context = entries[0].get_shared_context_for_test();
+    let first_handle = first_runtime.handle().clone();
+    drop(first_runtime);
+    {
+        // The drain this starts is dropped unrun: its runtime has shut down.
+        let _runtime = first_handle.enter();
+        drop(entries.remove(0));
+    }
+    assert_eq!(shared_context.active_drop_spawns.load(Ordering::Acquire), 1);
+
+    let second_runtime = runtime_counting_blocking_threads(&UNUSED_THREADS_STARTED)?;
+    #[expect(clippy::disallowed_methods, reason = "test drives its own runtime")]
+    second_runtime.block_on(async {
+        drop(entries);
+        wait_until_retired_files_deleted(&shared_context).await?;
+        drop(store);
+        check_storage_dir_empty(&temp_path).await
+    })
+}
+
+/// Cleanups overlap: each write retires the entries its insertion displaced
+/// after it releases its write permit, and explicit removals retire their
+/// entry themselves. However many overlap, the store runs one retirement
+/// operation (a rename into the temp directory or an executable-variant
+/// unlink) at a time, plus its one drain deleting retired files: the kernel
+/// performs those renames one at a time per filesystem, so more operations
+/// in flight only hold more blocking-pool threads.
+#[test]
+fn overlapping_retirements_hold_at_most_two_blocking_threads() -> Result<(), Error> {
+    static BLOCKING_THREADS_STARTED: AtomicU64 = AtomicU64::new(0);
+    check_overlapping_retirements(&BLOCKING_THREADS_STARTED, false)
+}
+
+/// The same bound holds when every removed digest also has an executable
+/// variant, whose cleanup waits for its digest's variant lease and then for
+/// retirement admission.
+#[test]
+fn overlapping_variant_retirements_hold_at_most_two_blocking_threads() -> Result<(), Error> {
+    static BLOCKING_THREADS_STARTED: AtomicU64 = AtomicU64::new(0);
+    check_overlapping_retirements(&BLOCKING_THREADS_STARTED, true)
+}
+
+fn check_overlapping_retirements(
+    blocking_threads_started: &'static AtomicU64,
+    with_executable_variants: bool,
+) -> Result<(), Error> {
+    const RETIRING_ENTRIES: u64 = 64;
+    let runtime = runtime_counting_blocking_threads(blocking_threads_started)?;
+    #[expect(clippy::disallowed_methods, reason = "test drives its own runtime")]
+    runtime.block_on(async {
+        let content_path = make_temp_path("content_path");
+        let temp_path = make_temp_path("temp_path");
+        let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+            content_path: content_path.clone(),
+            temp_path: temp_path.clone(),
+            ..Default::default()
+        })
+        .await?;
+        let keys = (0..RETIRING_ENTRIES)
+            .map(|i| DigestInfo::try_new(&format!("{i:064x}"), 1).map(StoreKey::Digest))
+            .collect::<Result<Vec<_>, _>>()?;
+        for key in &keys {
+            store
+                .update_oneshot(key.borrow(), Bytes::from_static(b"x"))
+                .await?;
+        }
+        let mut variants = Vec::new();
+        if with_executable_variants {
+            for key in &keys {
+                let StoreKey::Digest(digest) = key else {
+                    unreachable!("keys are digests");
+                };
+                variants.push(store.get_executable_hardlink_source(digest).await?);
+            }
+        }
+        let evicting_map = store.get_evicting_map();
+
+        let started_before = blocking_threads_started.load(Ordering::SeqCst);
+        let removed =
+            futures::future::join_all(keys.iter().map(|key| evicting_map.remove(key))).await;
+        assert!(removed.iter().all(|removed| *removed));
+        // Read the temp directory without the blocking pool, so that waiting
+        // starts no thread of its own.
+        let retired_dir = format!("{temp_path}/{DIGEST_FOLDER_V2}");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while std::fs::read_dir(&retired_dir)?.next().is_some() {
+                sleep(Duration::from_millis(1)).await;
+            }
+            Ok::<_, Error>(())
+        })
+        .await
+        .map_err(|_| make_err!(Code::DeadlineExceeded, "retired files were not deleted"))??;
+        let started = blocking_threads_started.load(Ordering::SeqCst) - started_before;
+        assert!(
+            started <= 2,
+            "{RETIRING_ENTRIES} overlapping retirements started {started} blocking threads",
+        );
+        for key in &keys {
+            assert!(!content_file_exists(&content_path, key).await?);
+        }
+        for variant in &variants {
+            assert!(
+                !Path::new(variant).exists(),
+                "retired variant {} remains",
+                variant.display()
+            );
+        }
+        Ok(())
+    })
 }

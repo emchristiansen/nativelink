@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use std::sync::Arc;
@@ -22,7 +24,7 @@ use nativelink_config::stores::EvictionPolicy;
 use nativelink_error::Error;
 use nativelink_macro::nativelink_test;
 use nativelink_util::common::DigestInfo;
-use nativelink_util::evicting_map::{EvictingMap, LenEntry};
+use nativelink_util::evicting_map::{EvictingMap, LenEntry, RemoveItemCallback};
 use nativelink_util::instant_wrapper::MockInstantWrapped;
 use pretty_assertions::assert_eq;
 
@@ -1376,5 +1378,215 @@ async fn snapshot_display_info() -> Result<(), Error> {
         format!("{snapshot}"),
         "Bytes: 3 of 11 (27.273%); Items: 1 of 6 (16.667%); Timeout: unlimited"
     );
+    Ok(())
+}
+
+/// Tracks how many cleanup operations (remove callbacks or `unref()`s) are in
+/// progress at once, and the most that ever were. Each operation yields to
+/// the scheduler a few times before finishing, as a filesystem store's
+/// cleanup does while it waits for a blocking-pool thread, so operations
+/// that are started together are observed together.
+#[derive(Debug, Default)]
+struct CleanupConcurrency {
+    in_progress: AtomicU64,
+    peak: AtomicU64,
+    finished: AtomicU64,
+}
+
+impl CleanupConcurrency {
+    async fn run(&self) {
+        let in_progress = self.in_progress.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(in_progress, Ordering::SeqCst);
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        self.in_progress.fetch_sub(1, Ordering::SeqCst);
+        self.finished.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TrackedUnref {
+    size: u64,
+    unrefs: Arc<CleanupConcurrency>,
+    callbacks: Arc<CleanupConcurrency>,
+    unref_saw_unfinished_callback: Arc<AtomicBool>,
+    expected_callbacks: u64,
+}
+
+impl LenEntry for TrackedUnref {
+    fn len(&self) -> u64 {
+        self.size
+    }
+
+    fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    async fn unref(&self) {
+        if self.callbacks.finished.load(Ordering::SeqCst) < self.expected_callbacks {
+            self.unref_saw_unfinished_callback
+                .store(true, Ordering::SeqCst);
+        }
+        self.unrefs.run().await;
+    }
+}
+
+#[derive(Debug)]
+struct TrackedCallback(Arc<CleanupConcurrency>);
+
+impl RemoveItemCallback<DigestInfo> for TrackedCallback {
+    fn callback(&self, _store_key: &DigestInfo) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let callbacks = self.0.clone();
+        Box::pin(async move { callbacks.run().await })
+    }
+}
+
+const RETIRED_ENTRIES: u64 = 64;
+
+/// The cleanup of every entry that leaves the map at once (here one eviction
+/// of `RETIRED_ENTRIES` entries) must run one operation at a time: all remove
+/// callbacks, then all `unref()`s, each finished before the next starts. A
+/// filesystem store's cleanup is a rename or unlink that the kernel performs
+/// one at a time anyway, and running the operations of an eviction together
+/// held one blocking-pool thread per evicted entry until none was left for
+/// any other file operation.
+async fn assert_retires_one_at_a_time<F, Fut>(retire: F) -> Result<(), Error>
+where
+    F: FnOnce(
+        EvictingMap<DigestInfo, DigestInfo, TrackedUnref, MockInstantWrapped, TrackedCallback>,
+        Box<dyn Fn(u64) -> TrackedUnref + Send>,
+        Vec<DigestInfo>,
+    ) -> Fut,
+    Fut: Future<Output = Result<(), Error>>,
+{
+    let unrefs = Arc::new(CleanupConcurrency::default());
+    let callbacks = Arc::new(CleanupConcurrency::default());
+    let unref_saw_unfinished_callback = Arc::new(AtomicBool::new(false));
+    let evicting_map = EvictingMap::<_, _, _, _, TrackedCallback>::new(
+        &EvictionPolicy {
+            max_count: 0,
+            max_seconds: 0,
+            max_bytes: 1000,
+            evict_bytes: 0,
+        },
+        MockInstantWrapped::default(),
+    );
+    evicting_map.add_remove_callback(TrackedCallback(callbacks.clone()));
+    let make_entry = {
+        let (unrefs, callbacks, unref_saw_unfinished_callback) = (
+            unrefs.clone(),
+            callbacks.clone(),
+            unref_saw_unfinished_callback.clone(),
+        );
+        Box::new(move |size| TrackedUnref {
+            size,
+            unrefs: unrefs.clone(),
+            callbacks: callbacks.clone(),
+            unref_saw_unfinished_callback: unref_saw_unfinished_callback.clone(),
+            expected_callbacks: RETIRED_ENTRIES,
+        })
+    };
+    let keys = (0..RETIRED_ENTRIES)
+        .map(|i| DigestInfo::try_new(&format!("{i:064x}"), 1))
+        .collect::<Result<Vec<_>, _>>()?;
+    for key in &keys {
+        evicting_map.insert(*key, make_entry(1)).await;
+    }
+    assert_eq!(unrefs.finished.load(Ordering::SeqCst), 0);
+
+    retire(evicting_map, make_entry, keys).await?;
+
+    assert_eq!(callbacks.finished.load(Ordering::SeqCst), RETIRED_ENTRIES);
+    assert_eq!(unrefs.finished.load(Ordering::SeqCst), RETIRED_ENTRIES);
+    assert_eq!(
+        callbacks.peak.load(Ordering::SeqCst),
+        1,
+        "remove callbacks of one eviction must run one at a time",
+    );
+    assert_eq!(
+        unrefs.peak.load(Ordering::SeqCst),
+        1,
+        "unrefs of one eviction must run one at a time",
+    );
+    assert!(
+        !unref_saw_unfinished_callback.load(Ordering::SeqCst),
+        "every remove callback must finish before the first unref",
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn insert_eviction_retires_entries_one_at_a_time() -> Result<(), Error> {
+    assert_retires_one_at_a_time(|evicting_map, make_entry, _keys| async move {
+        // 64 resident bytes + 999 reach max_bytes (1000); eviction removes
+        // the 64 older entries and stops below it.
+        let big_key = DigestInfo::try_new(HASH1, 999)?;
+        evicting_map.insert(big_key, make_entry(999)).await;
+        assert_eq!(evicting_map.size_for_key(&big_key).await, Some(999));
+        Ok(())
+    })
+    .await
+}
+
+#[nativelink_test]
+async fn insert_many_eviction_retires_entries_one_at_a_time() -> Result<(), Error> {
+    assert_retires_one_at_a_time(|evicting_map, make_entry, _keys| async move {
+        let big_key = DigestInfo::try_new(HASH1, 999)?;
+        let displaced = evicting_map.insert_many([(big_key, make_entry(999))]).await;
+        assert_eq!(displaced.len() as u64, RETIRED_ENTRIES);
+        Ok(())
+    })
+    .await
+}
+
+#[nativelink_test]
+async fn lease_release_eviction_retires_entries_one_at_a_time() -> Result<(), Error> {
+    assert_retires_one_at_a_time(|evicting_map, make_entry, keys| async move {
+        // While every entry is leased the map may exceed max_bytes; releasing
+        // the leases trims it, as an action's input leases do at teardown.
+        for key in &keys {
+            evicting_map.lease_key(*key);
+        }
+        let big_key = DigestInfo::try_new(HASH1, 999)?;
+        evicting_map.lease_key(big_key);
+        evicting_map.insert(big_key, make_entry(999)).await;
+        assert_eq!(evicting_map.size_for_key(&keys[0]).await, Some(1));
+        evicting_map.release_keys(keys.iter()).await;
+        assert_eq!(evicting_map.size_for_key(&big_key).await, Some(999));
+        Ok(())
+    })
+    .await
+}
+
+/// `is_resident` reports an entry, even an expired one, without reaping it:
+/// it removes nothing, so it never runs a remove callback or an `unref()`.
+#[nativelink_test]
+async fn is_resident_does_not_reap_expired_entry() -> Result<(), Error> {
+    let evicting_map = EvictingMap::<DigestInfo, DigestInfo, BytesWrapper, MockInstantWrapped>::new(
+        &EvictionPolicy {
+            max_count: 0,
+            max_seconds: 5,
+            max_bytes: 0,
+            evict_bytes: 0,
+        },
+        MockInstantWrapped::default(),
+    );
+    let key = DigestInfo::try_new(HASH1, 0)?;
+    let absent = DigestInfo::try_new(HASH2, 0)?;
+    evicting_map
+        .insert(key, Bytes::from("12345678").into())
+        .await;
+    MockClock::advance(Duration::from_secs(10));
+
+    assert!(evicting_map.is_resident(&key));
+    assert!(!evicting_map.is_resident(&absent));
+    assert_eq!(evicting_map.len_for_test(), 1, "is_resident must not reap");
+
+    assert!(
+        evicting_map.get(&key).await.is_none(),
+        "get reaps the expired entry"
+    );
+    assert!(!evicting_map.is_resident(&key));
     Ok(())
 }
