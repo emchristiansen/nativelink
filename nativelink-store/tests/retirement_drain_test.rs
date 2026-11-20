@@ -461,7 +461,10 @@ async fn drain_passes_a_victim_whose_reader_holds_its_path() -> Result<(), Error
     drop(reader);
     settle(&store).await;
     assert_eq!(store.retirement_accounting().detached_total, 1);
-    assert_eq!(content_files_of(&dirs, digests[0]).await, Vec::<String>::new());
+    assert_eq!(
+        content_files_of(&dirs, digests[0]).await,
+        Vec::<String>::new()
+    );
     drop(held);
     Ok(())
 }
