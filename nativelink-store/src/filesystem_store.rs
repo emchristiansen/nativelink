@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::io::SeekFrom;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Weak};
 use std::time::{Instant, SystemTime};
 
@@ -32,7 +33,7 @@ use async_lock::{Mutex, MutexGuardArc};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::stream::{StreamExt, TryStreamExt};
-use futures::{Future, TryFutureExt};
+use futures::{Future, FutureExt, TryFutureExt};
 use jiff::Timestamp;
 use nativelink_config::stores::FilesystemSpec;
 use nativelink_error::{Code, Error, ResultExt, make_err};
@@ -98,7 +99,7 @@ pub enum FileType {
     String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum RetirementKind {
     Rename,
     Variant,
@@ -122,16 +123,236 @@ pub struct SharedContext {
     /// Admits one retirement operation of this store at a time. See
     /// [`SharedContext::retire_blocking`].
     retirement: Arc<Semaphore>,
+    /// The operation holding `retirement`, if any. Diagnostic only: the
+    /// retirement drain names it in its backlog report while a unit is
+    /// pending (see [`RetirementQueue::report_backlog`]).
+    retirement_holder: RetirementHolderSlot,
+    /// Retirements waiting for `retirement`, and when the waiting warning is
+    /// due. Diagnostic only: see [`RetirementWaiters`].
+    retirement_waiters: Arc<RetirementWaiters>,
     /// Test hook run on the blocking pool right after a retirement rename
     /// has succeeded and before its new path is recorded. See
     /// [`FilesystemStore::set_after_retire_rename_hook_for_test`].
     after_retire_rename: RetireRenameHook,
+    /// Test hook run on the blocking pool by every admitted retirement
+    /// operation, before it runs. See
+    /// [`FilesystemStore::set_before_retirement_operation_hook_for_test`].
+    before_retirement_operation: RetireRenameHook,
     /// Retirement operations from their submission to the blocking pool to
     /// the end of their closure. See [`SharedContext::retire_blocking`].
     retirement_operations: Arc<BlockingOccupancy>,
     /// Retired-file drains from their submission to the blocking pool to
     /// their end. See [`SharedContext::retire_file`].
     file_deletions: Arc<BlockingOccupancy>,
+}
+
+/// The store's current retirement-admission holder, shared by its
+/// [`SharedContext`] (which sets it) and its [`RetirementQueue`] (which
+/// reports it). Ported from the holder diagnostic of nix-config 530c24d7,
+/// without its timer: a retirement waiting for the admission arms no timer,
+/// so a retirement future carried to another runtime (a requeued unit) holds
+/// no timer of a runtime that may have shut down.
+type RetirementHolderSlot = Arc<parking_lot::Mutex<Option<RetirementHolder>>>;
+
+/// Numbers retirement admissions for [`RetirementHolder::operation_id`].
+static NEXT_RETIREMENT_ID: AtomicU64 = AtomicU64::new(0);
+
+/// A snapshot of the operation that took the retirement admission, not proof
+/// that it is inside a system call now.
+#[derive(Clone, Debug)]
+struct RetirementHolder {
+    operation_id: u64,
+    write_id: Option<u64>,
+    write_key: Option<String>,
+    kind: RetirementKind,
+    acquired: Instant,
+    /// A waiting retirement's warning named this holder (see
+    /// [`RetirementWaiters`]), so its release is reported too.
+    reported: bool,
+}
+
+/// The retirement admission and its holder record. It lives with the
+/// admission in the blocking closure, including after the caller is
+/// cancelled, and clears the record before releasing the admission.
+struct RetirementAdmission {
+    holder: RetirementHolderSlot,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Drop for RetirementAdmission {
+    fn drop(&mut self) {
+        let reported = self
+            .holder
+            .lock()
+            .take()
+            .filter(|holder| holder.reported)
+            .map(|holder| (holder.operation_id, holder.acquired.elapsed().as_millis()));
+        // The record is cleared before the admission is released, and the
+        // warning is logged after both, holding neither.
+        drop(self.permit.take());
+        if let Some((holder_operation_id, held_ms)) = reported {
+            warn!(
+                holder_operation_id,
+                held_ms, "Reported filesystem retirement admission holder released"
+            );
+        }
+    }
+}
+
+/// How long a retirement waits for the admission before it is reported, and
+/// how often waits are checked. See [`RetirementWaiters`].
+const RETIREMENT_WAIT_WARNING: Duration = Duration::from_secs(5);
+const RETIREMENT_WAIT_CHECK: Duration = Duration::from_secs(1);
+
+/// One retirement waiting for the admission.
+#[derive(Clone, Debug)]
+struct RetirementWaiter {
+    write_id: Option<u64>,
+    kind: RetirementKind,
+    since: Instant,
+}
+
+/// The retirements of a store waiting for its admission, ported from the
+/// per-waiter warning of the holder diagnostic in nix-config 530c24d7.
+///
+/// There, each waiting retirement armed a 5 s timer inside its own future and
+/// logged a warning naming the holder, at most once per holder, then waited on
+/// in place. A retirement future can be requeued by a cancelled drain and
+/// polled again on another runtime, where a timer of the first runtime
+/// panics. Here a waiting retirement only registers itself (it arms no
+/// timer); the store's own watch task ([`watch_retirement_waiters`]) checks
+/// the waiters every [`RETIREMENT_WAIT_CHECK`] and, once one has waited
+/// [`RETIREMENT_WAIT_WARNING`], logs that warning with the same fields and
+/// limit. The release of a reported holder is logged by
+/// [`RetirementAdmission`]. Diagnostic only: nothing here admits, orders or
+/// cancels a retirement.
+#[derive(Debug)]
+struct RetirementWaiters {
+    waiting: parking_lot::Mutex<HashMap<u64, RetirementWaiter>>,
+    warning_ms: AtomicU64,
+    check_ms: AtomicU64,
+    /// Test hook run by [`RetirementWaiters::warn_once_per_holder`] right
+    /// after it selects a waiter. See
+    /// [`FilesystemStore::set_retirement_wait_selected_hook_for_test`].
+    selected: RetireRenameHook,
+}
+
+impl Default for RetirementWaiters {
+    fn default() -> Self {
+        Self {
+            waiting: parking_lot::Mutex::default(),
+            warning_ms: AtomicU64::new(
+                u64::try_from(RETIREMENT_WAIT_WARNING.as_millis()).unwrap_or(u64::MAX),
+            ),
+            check_ms: AtomicU64::new(
+                u64::try_from(RETIREMENT_WAIT_CHECK.as_millis()).unwrap_or(u64::MAX),
+            ),
+            selected: RetireRenameHook::default(),
+        }
+    }
+}
+
+/// Registers a waiting retirement until dropped: when it is admitted, or when
+/// its future is dropped while it waits.
+struct WaitingRetirement<'a> {
+    waiters: &'a RetirementWaiters,
+    operation_id: u64,
+}
+
+impl Drop for WaitingRetirement<'_> {
+    fn drop(&mut self) {
+        self.waiters.waiting.lock().remove(&self.operation_id);
+    }
+}
+
+impl RetirementWaiters {
+    fn wait(&self, operation_id: u64, waiter: RetirementWaiter) -> WaitingRetirement<'_> {
+        self.waiting.lock().insert(operation_id, waiter);
+        WaitingRetirement {
+            waiters: self,
+            operation_id,
+        }
+    }
+
+    fn check_every(&self) -> Duration {
+        Duration::from_millis(self.check_ms.load(Ordering::Relaxed))
+    }
+
+    /// Logs the longest-waiting retirement past the warning threshold, naming
+    /// the holder, unless that holder has already been reported.
+    ///
+    /// The waiter is selected, and the holder read and marked reported, under
+    /// the waiters' lock, taken before the holder's (the only place both are
+    /// held; nothing takes them in the other order). A selected waiter is
+    /// therefore still waiting while the holder is read: it cannot have been
+    /// cancelled, nor admitted (a retirement leaves the waiters before it
+    /// publishes itself as the holder, see [`SharedContext::retire_blocking`]),
+    /// so it is never reported as waiting on itself, and a waiter that is
+    /// gone never uses up the next holder's one warning. The warning is
+    /// logged after both locks are released.
+    fn warn_once_per_holder(&self, holder: &RetirementHolderSlot) {
+        let warning = Duration::from_millis(self.warning_ms.load(Ordering::Relaxed));
+        let report = {
+            let waiting = self.waiting.lock();
+            let Some((operation_id, waiter)) = waiting
+                .iter()
+                .max_by_key(|(_, waiter)| waiter.since.elapsed())
+                .filter(|(_, waiter)| waiter.since.elapsed() >= warning)
+                .map(|(operation_id, waiter)| (*operation_id, waiter.clone()))
+            else {
+                return;
+            };
+            let selected = self.selected.0.lock().clone();
+            if let Some(selected) = selected {
+                selected();
+            }
+            let mut holder = holder.lock();
+            holder.as_mut().and_then(|holder| {
+                if holder.reported {
+                    None
+                } else {
+                    holder.reported = true;
+                    Some((operation_id, waiter, holder.clone()))
+                }
+            })
+        };
+        if let Some((operation_id, waiter, holder)) = report {
+            warn!(
+                operation_id,
+                write_id = ?waiter.write_id,
+                kind = ?waiter.kind,
+                waited_ms = waiter.since.elapsed().as_millis(),
+                holder = ?(
+                    holder.operation_id,
+                    holder.write_id,
+                    holder.write_key.as_deref(),
+                    holder.kind,
+                    holder.acquired.elapsed().as_millis()
+                ),
+                "Filesystem retirement admission is still waiting; holder is a point-in-time snapshot"
+            );
+        }
+    }
+}
+
+/// The store's watch task for [`RetirementWaiters`]. It holds the store's
+/// context weakly and ends once the store is gone (or with its runtime).
+async fn watch_retirement_waiters(context: Weak<SharedContext>) {
+    loop {
+        let Some(every) = context
+            .upgrade()
+            .map(|c| c.retirement_waiters.check_every())
+        else {
+            return;
+        };
+        tokio::time::sleep(every).await;
+        let Some(context) = context.upgrade() else {
+            return;
+        };
+        context
+            .retirement_waiters
+            .warn_once_per_holder(&context.retirement_holder);
+    }
 }
 
 /// Counts the blocking-pool closures of one kind that have been submitted and
@@ -204,7 +425,10 @@ impl SharedContext {
             content_path,
             retired_files: parking_lot::Mutex::default(),
             retirement: Arc::new(Semaphore::new(1)),
+            retirement_holder: Arc::default(),
+            retirement_waiters: Arc::default(),
             after_retire_rename: RetireRenameHook::default(),
+            before_retirement_operation: RetireRenameHook::default(),
             retirement_operations: Arc::default(),
             file_deletions: Arc::default(),
         }
@@ -257,12 +481,34 @@ impl SharedContext {
                 RetirementKind::Variant => "variant_admission",
             });
         }
-        let admission = self
+        let operation_id = NEXT_RETIREMENT_ID.fetch_add(1, Ordering::Relaxed);
+        let waiting = self.retirement_waiters.wait(
+            operation_id,
+            RetirementWaiter {
+                write_id: trace.as_ref().map(|t| t.id),
+                kind,
+                since: Instant::now(),
+            },
+        );
+        let permit = self
             .retirement
             .clone()
             .acquire_owned()
             .await
             .map_err(|err| Error::from_std_err(Code::Internal, &err))?;
+        drop(waiting);
+        *self.retirement_holder.lock() = Some(RetirementHolder {
+            operation_id,
+            write_id: trace.as_ref().map(|t| t.id),
+            write_key: trace.as_ref().map(|t| t.key.clone()),
+            kind,
+            acquired: Instant::now(),
+            reported: false,
+        });
+        let admission = RetirementAdmission {
+            holder: self.retirement_holder.clone(),
+            permit: Some(permit),
+        };
         if let Some(trace) = &trace {
             trace.retirement_detail(match kind {
                 RetirementKind::Rename => "rename_queue",
@@ -270,6 +516,7 @@ impl SharedContext {
             });
         }
         let occupied = self.retirement_operations.enter();
+        let before_operation = self.before_retirement_operation.0.lock().clone();
         spawn_blocking!("filesystem_store_retire", move || {
             // Dropped in reverse: the closure stops counting as occupied
             // before its admission lets the next operation be submitted.
@@ -280,6 +527,9 @@ impl SharedContext {
                     RetirementKind::Rename => "rename_operation",
                     RetirementKind::Variant => "variant_operation",
                 });
+            }
+            if let Some(before_operation) = &before_operation {
+                before_operation();
             }
             let result = operation();
             if let Some(trace) = &trace {
@@ -419,6 +669,9 @@ struct RetirementState<Fe> {
     detached_started_total: u64,
     /// Detached unrefs dropped unfinished and put back on the queue.
     requeued_detached_total: u64,
+    /// Units whose future panicked, abandoned by the drain (see
+    /// [`RetirementDrain::run`]).
+    panicked_units_total: u64,
     /// Reservations currently asleep waiting for space.
     waiting_reservations: u64,
 }
@@ -480,6 +733,8 @@ pub struct RetirementQueue<Fe> {
     state: parking_lot::Mutex<RetirementState<Fe>>,
     /// The store's content path, naming the store in backlog reports.
     content_path: String,
+    /// The store's retirement-admission holder, named in backlog reports.
+    holder: RetirementHolderSlot,
     /// How long a drain runs between backlog reports, in milliseconds. See
     /// [`RetirementDrain::run`].
     report_every_ms: AtomicU64,
@@ -515,6 +770,7 @@ pub struct RetirementAccounting {
     pub detached_total: u64,
     pub detached_started_total: u64,
     pub requeued_detached_total: u64,
+    pub panicked_units_total: u64,
     pub waiting_reservations: u64,
 }
 
@@ -526,9 +782,10 @@ pub struct RetirementAccounting {
 const RETIREMENT_REPORT_EVERY: Duration = Duration::from_secs(10);
 
 impl<Fe: FileEntry> RetirementQueue<Fe> {
-    fn new(content_path: String) -> Self {
+    fn new(content_path: String, holder: RetirementHolderSlot) -> Self {
         Self {
             content_path,
+            holder,
             report_every_ms: AtomicU64::new(
                 u64::try_from(RETIREMENT_REPORT_EVERY.as_millis()).unwrap_or(u64::MAX),
             ),
@@ -543,6 +800,7 @@ impl<Fe: FileEntry> RetirementQueue<Fe> {
                 detached_total: 0,
                 detached_started_total: 0,
                 requeued_detached_total: 0,
+                panicked_units_total: 0,
                 waiting_reservations: 0,
             }),
             space_freed: tokio::sync::Notify::new(),
@@ -664,6 +922,15 @@ impl<Fe: FileEntry> RetirementQueue<Fe> {
             Some((kind, since)) => (kind, since.elapsed().as_millis()),
             None => ("none", 0),
         };
+        let holder = self.holder.lock().clone().map(|h| {
+            (
+                h.operation_id,
+                h.write_id,
+                h.write_key,
+                h.kind,
+                h.acquired.elapsed().as_millis(),
+            )
+        });
         info!(
             store = %self.content_path,
             units_run,
@@ -674,6 +941,7 @@ impl<Fe: FileEntry> RetirementQueue<Fe> {
             queued_units = backlog.queued_units,
             queued_bytes = backlog.queued_bytes,
             detached_in_flight = backlog.detached_in_flight,
+            holder = ?holder,
             "Filesystem store retirement backlog"
         );
     }
@@ -690,6 +958,7 @@ impl<Fe: FileEntry> RetirementQueue<Fe> {
             detached_total: state.detached_total,
             detached_started_total: state.detached_started_total,
             requeued_detached_total: state.requeued_detached_total,
+            panicked_units_total: state.panicked_units_total,
             waiting_reservations: state.waiting_reservations,
         }
     }
@@ -843,7 +1112,7 @@ impl<Fe: FileEntry> RetirementDrain<Fe> {
                 self.current = Some(unit);
             }
             let unit_started = Instant::now();
-            let completed_unref = {
+            let outcome = {
                 // `self.current` stays in place while its unit runs, so a drain
                 // dropped meanwhile puts it back on the queue (see `Drop`).
                 let (pending_unit, unit) = match self.current.as_mut() {
@@ -862,13 +1131,21 @@ impl<Fe: FileEntry> RetirementDrain<Fe> {
                     ),
                     None => unreachable!("a unit was just taken"),
                 };
+                // A unit whose future panics can never be polled again. Caught
+                // here, the drain abandons it and goes on to the units behind
+                // it; uncaught, the drain's `Drop` would put the panicked unit
+                // back at the queue's head, and every later drain would panic
+                // on it and never reach the rest. Unwind safety: the abandoned
+                // future is dropped, never observed again, and the state it
+                // shares with the store is behind locks that do not poison.
+                let unit = AssertUnwindSafe(unit).catch_unwind();
                 tokio::pin!(unit);
                 loop {
                     let next_report =
                         tokio::time::Instant::from_std(last_report + self.queue.report_every());
                     tokio::select! {
                         biased;
-                        completed_unref = &mut unit => break completed_unref,
+                        outcome = &mut unit => break outcome,
                         () = tokio::time::sleep_until(next_report) => {
                             last_report = Instant::now();
                             self.queue.report_backlog(
@@ -882,13 +1159,17 @@ impl<Fe: FileEntry> RetirementDrain<Fe> {
                 }
             };
             let unit = self.current.take();
-            if let (Some(RetirementUnit::Unref(entry)), Some(unrefed)) = (unit, completed_unref) {
-                let bytes = entry.len();
-                if !unrefed {
-                    self.queue.detach_unref(entry);
+            match (unit, outcome) {
+                (Some(RetirementUnit::Unref(entry)), Ok(Some(unrefed))) => {
+                    let bytes = entry.len();
+                    if !unrefed {
+                        self.queue.detach_unref(entry);
+                    }
+                    self.queue.release_queued(bytes);
+                    unref_bytes = unref_bytes.saturating_add(bytes);
                 }
-                self.queue.release_queued(bytes);
-                unref_bytes = unref_bytes.saturating_add(bytes);
+                (unit, Err(panic)) => self.abandon_panicked(unit.as_ref(), &*panic, unit_started),
+                _ => {}
             }
             units_run += 1;
             if last_report.elapsed() >= self.queue.report_every() {
@@ -897,6 +1178,56 @@ impl<Fe: FileEntry> RetirementDrain<Fe> {
                     .report_backlog(started, units_run, unref_bytes, None);
             }
         }
+    }
+
+    /// Accounts for a unit whose future panicked, which the drain abandons.
+    ///
+    /// A callback's future is the work itself: once it has panicked it cannot
+    /// be polled again (unlike a cancelled callback, which `Drop` requeues and
+    /// a later drain resumes), so the work it still owed (for the CAS, deleting
+    /// an executable variant) is not done. An unref's file is not retired by
+    /// this drain: the entry has already left the map, so its file stays where
+    /// the panic left it, in the content directory (which the store loads
+    /// again when it next starts) or in the temp directory (which it clears).
+    /// Either way the unit is counted in
+    /// [`RetirementAccounting::panicked_units_total`] and named in an error,
+    /// and an unref's bytes are released so the queue does not count them as
+    /// owed forever.
+    fn abandon_panicked(
+        &self,
+        unit: Option<&RetirementUnit<Fe>>,
+        panic: &(dyn core::any::Any + Send),
+        unit_started: Instant,
+    ) {
+        let message = panic
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned());
+        let (pending_unit, abandoned_bytes, unref_key) = match unit {
+            Some(RetirementUnit::Callback(_)) => ("callback", 0, None),
+            Some(RetirementUnit::Unref(entry)) => (
+                "unref",
+                entry.len(),
+                entry
+                    .get_encoded_file_path()
+                    .try_read()
+                    .map(|path| format!("{:?}", path.key)),
+            ),
+            None => ("none", 0, None),
+        };
+        self.queue.state.lock().panicked_units_total += 1;
+        if abandoned_bytes > 0 {
+            self.queue.release_queued(abandoned_bytes);
+        }
+        error!(
+            store = %self.queue.content_path,
+            pending_unit,
+            pending_ms = unit_started.elapsed().as_millis(),
+            abandoned_bytes,
+            ?unref_key,
+            panic = ?message,
+            "Filesystem store retirement unit panicked; the drain abandons it and continues"
+        );
     }
 
     fn report_caught_up(&self, started: Instant, units_run: u64, unref_bytes: u64) {
@@ -2977,6 +3308,10 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             spec.temp_path.clone(),
             spec.content_path.clone(),
         ));
+        background_spawn!(
+            "filesystem_store_retirement_watch",
+            watch_retirement_waiters(Arc::downgrade(&shared_context))
+        );
         #[cfg(unix)]
         let executable_locks = Arc::<ExecutableLocks>::default();
 
@@ -3045,7 +3380,10 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             })
             .ok();
 
-        let retirement = Arc::new(RetirementQueue::new(shared_context.content_path.clone()));
+        let retirement = Arc::new(RetirementQueue::new(
+            shared_context.content_path.clone(),
+            shared_context.retirement_holder.clone(),
+        ));
         Ok(Arc::new_cyclic(|weak_self| Self {
             shared_context,
             evicting_map,
@@ -3130,6 +3468,41 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     /// If `every` is shorter than a millisecond: a drain waiting for a unit
     /// reports once per interval, and a zero interval would report without
     /// pause.
+    /// Sets how long a retirement waits for the admission before it is
+    /// reported, and how often waits are checked. Takes effect from the watch
+    /// task's next check.
+    pub fn set_retirement_wait_warning_for_test(&self, after: Duration, check_every: Duration) {
+        let waiters = &self.shared_context.retirement_waiters;
+        waiters.warning_ms.store(
+            u64::try_from(after.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        waiters.check_ms.store(
+            u64::try_from(check_every.as_millis().max(1)).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Runs `hook` in the store's waiting-retirement check right after it has
+    /// selected a waiter, before it reads the holder, so a test can act in
+    /// that gap.
+    pub fn set_retirement_wait_selected_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self.shared_context.retirement_waiters.selected.0.lock() = hook;
+    }
+
+    /// Runs `hook` on the blocking pool in every admitted retirement operation
+    /// (a rename or a variant unlink) of this store, before the operation, so
+    /// a test can hold the admission in an actual operation.
+    pub fn set_before_retirement_operation_hook_for_test(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self.shared_context.before_retirement_operation.0.lock() = hook;
+    }
+
     pub fn set_retirement_report_interval_for_test(&self, every: Duration) {
         assert!(
             every >= Duration::from_millis(1),

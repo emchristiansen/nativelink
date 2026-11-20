@@ -992,3 +992,672 @@ fn reservation_asleep_before_drain_cancellation_restarts_it() -> Result<(), Erro
         Ok(())
     })
 }
+
+// Holder-diagnostic port (nix-config 530c24d7, without its timer): while the
+// drain waits for the retirement admission, its backlog report names the
+// operation holding the admission, here an explicit removal whose rename is
+// held, before that holder is released.
+#[nativelink_test]
+async fn a_stalled_drain_names_the_admission_holder() -> Result<(), Error> {
+    use nativelink_util::store_trait::StoreKey;
+    const N: usize = 40;
+    const INTERVAL: Duration = Duration::from_millis(100);
+    let _serial = SERIAL.lock().await;
+    let dirs = dirs();
+    let store = open_store(&dirs, N * SIZE, N * SIZE / 2).await?;
+    let digests = fill(&store, N - 1).await?;
+    store.set_retirement_report_interval_for_test(INTERVAL);
+
+    // The removal's rename holds the admission inside its blocking closure
+    // until released; only the first rename is held.
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+    let release_rx = std::sync::Mutex::new(Some(release_rx));
+    store.set_after_retire_rename_hook_for_test(Some(Arc::new(move || {
+        let entered = entered_tx.lock().unwrap().take();
+        if let Some(tx) = entered {
+            tx.send(()).unwrap();
+            let release = release_rx.lock().unwrap().take();
+            if let Some(rx) = release {
+                rx.recv().unwrap();
+            }
+        }
+    })));
+    let removed = digests[N - 2];
+    let holder = tokio::spawn({
+        let map = store.get_evicting_map();
+        async move { map.remove(&StoreKey::Digest(removed)).await }
+    });
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(WAIT))
+        .await
+        .expect("join")
+        .expect("the removal's rename reached its hook");
+
+    // Insertions past the limit (the removal freed one entry) queue an
+    // eviction batch; its drain waits for the admission the removal holds.
+    for index in N..N + 3 {
+        write(&store, index).await?;
+    }
+    let held = store.retirement_accounting();
+    assert!(held.queued_units > 0, "a batch is queued: {held:?}");
+    timeout(WAIT, async {
+        while !logs_contain("holder=Some(") {
+            sleep(INTERVAL / 4).await;
+        }
+    })
+    .await
+    .expect("no backlog report named the admission holder while it held it");
+    let store_field = format!("store={}", dirs.content);
+    logs_assert(|lines: &[&str]| {
+        let named = lines.iter().any(|line| {
+            line.contains(" INFO ")
+                && line.contains("Filesystem store retirement backlog")
+                && line.contains(&store_field)
+                && (line.contains("pending_unit=callback") || line.contains("pending_unit=unref"))
+                && line.contains("holder=Some(")
+                && line.contains("Rename")
+        });
+        if named {
+            Ok(())
+        } else {
+            Err("no pending-unit report naming a Rename holder".to_string())
+        }
+    });
+    assert!(
+        !holder.is_finished(),
+        "the holder is still running when named"
+    );
+
+    release_tx.send(()).unwrap();
+    assert!(
+        timeout(WAIT, holder)
+            .await
+            .expect("holder finished")
+            .expect("join")
+    );
+    store.set_after_retire_rename_hook_for_test(None);
+    settle(&store).await;
+    let settled = store.retirement_accounting();
+    assert_eq!((settled.queued_units, settled.queued_bytes), (0, 0));
+    Ok(())
+}
+
+/// A remove callback whose first run panics; every later run counts itself.
+#[derive(Debug, Default)]
+struct PanicsOnce {
+    panicked: core::sync::atomic::AtomicBool,
+    finished: core::sync::atomic::AtomicUsize,
+}
+
+impl nativelink_util::store_trait::RemoveItemCallback for PanicsOnce {
+    fn callback<'a>(
+        &'a self,
+        _store_key: nativelink_util::store_trait::StoreKey<'a>,
+    ) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        use core::sync::atomic::Ordering;
+        Box::pin(async move {
+            // Suspend once first, so the panic happens in a resumed poll.
+            tokio::task::yield_now().await;
+            assert!(
+                self.panicked.swap(true, Ordering::SeqCst),
+                "test remove callback panics once"
+            );
+            self.finished.fetch_add(1, Ordering::SeqCst);
+        })
+    }
+}
+
+/// Polls of a future that had already panicked, counted by a panic hook
+/// (which keeps them out of the test output), and the hook itself.
+static POISONED_REPOLLS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn count_poisoned_repolls() {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if info
+                .payload_as_str()
+                .is_some_and(|message| message.contains("resumed after panicking"))
+            {
+                POISONED_REPOLLS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+            } else {
+                previous(info);
+            }
+        }));
+    });
+}
+
+// DRAIN-PANIC-01 (review t_bbffedfb): a retirement unit whose future panics
+// must not strand the units queued behind it, nor be polled again. Before the
+// repair, the dropped drain put the panicked callback back at the queue's
+// head; every later drain resumed it ("`async fn` resumed after panicking"),
+// panicked again and never reached the rest, so the store's retirement never
+// settled again.
+#[nativelink_test]
+async fn a_panicking_retirement_unit_does_not_strand_the_queue() -> Result<(), Error> {
+    use core::sync::atomic::Ordering;
+    use nativelink_util::store_trait::StoreDriver;
+    const N: usize = 40;
+    let _serial = SERIAL.lock().await;
+    count_poisoned_repolls();
+    let repolls_before = POISONED_REPOLLS.load(Ordering::SeqCst);
+    let dirs = dirs();
+    let store = open_store(&dirs, N * SIZE, N * SIZE / 2).await?;
+    let digests = fill(&store, N - 1).await?;
+    let callback = Arc::new(PanicsOnce::default());
+    store.clone().register_remove_callback(callback.clone())?;
+
+    // An eviction batch: its first callback unit panics.
+    write(&store, N).await?;
+    eventually("the callback panicked", || {
+        callback.panicked.load(Ordering::SeqCst)
+    })
+    .await;
+    // Later evictions enqueue more work and start drains.
+    for index in N + 1..N + 4 {
+        write(&store, index).await?;
+    }
+    settle(&store).await;
+
+    let settled = store.retirement_accounting();
+    assert_eq!(
+        (settled.queued_units, settled.queued_bytes),
+        (0, 0),
+        "{settled:?}"
+    );
+    assert_eq!(settled.panicked_units_total, 1, "{settled:?}");
+    assert!(
+        callback.finished.load(Ordering::SeqCst) > 0,
+        "the units behind the panicked one ran"
+    );
+    for victim in &digests[..N / 2 - 1] {
+        assert_eq!(content_files_of(&dirs, *victim).await, Vec::<String>::new());
+    }
+    assert_eq!(POISONED_REPOLLS.load(Ordering::SeqCst), repolls_before);
+    assert!(logs_contain(
+        "Filesystem store retirement unit panicked; the drain abandons it and continues"
+    ));
+    assert!(logs_contain("pending_unit=\"callback\""));
+    Ok(())
+}
+
+// DRAIN-PANIC-01 with the optional cap: a write already asleep waiting for
+// space held by a batch whose callback then panics still gets its space,
+// without the panicked callback being polled again. Before the repair, the
+// dropped drain's wake-up made the waiter restart a drain that resumed the
+// panicked callback at the head, repeatedly, and the space never came.
+#[nativelink_test]
+async fn a_reservation_waiting_behind_a_panicking_unit_gets_its_space() -> Result<(), Error> {
+    use core::sync::atomic::Ordering;
+    use nativelink_util::store_trait::StoreDriver;
+    const N: usize = 40;
+    let _serial = SERIAL.lock().await;
+    count_poisoned_repolls();
+    let repolls_before = POISONED_REPOLLS.load(Ordering::SeqCst);
+    let dirs = dirs();
+    let store = open_store(&dirs, N * SIZE, N * SIZE / 2).await?;
+    let digests = fill(&store, N - 1).await?;
+    let callback = Arc::new(PanicsOnce::default());
+    store.clone().register_remove_callback(callback.clone())?;
+
+    // The batch is held at the retirement admission until released.
+    let admission = store.hold_retirement_admission_for_test().await;
+    write(&store, N).await?;
+    let held = store.retirement_accounting();
+    assert!(held.draining && held.queued_bytes > SIZE as u64, "{held:?}");
+    store.set_retirement_reservation_cap(Some(SIZE as u64));
+    let waiter = nativelink_util::background_spawn!("waiting_write", {
+        let store = store.clone();
+        async move { write(&store, N + 1).await }
+    });
+    eventually("the write to wait", || {
+        store.retirement_accounting().waiting_reservations == 1
+    })
+    .await;
+    assert!(!callback.panicked.load(Ordering::SeqCst));
+
+    // Released: the batch runs, its callback panics, and the rest must still
+    // free the space the write waits for.
+    drop(admission);
+    let written = timeout(WAIT, waiter)
+        .await
+        .expect("the waiting write never got its space")
+        .expect("join")?;
+    assert!(callback.panicked.load(Ordering::SeqCst));
+    settle(&store).await;
+    let settled = store.retirement_accounting();
+    assert_eq!(
+        (
+            settled.queued_units,
+            settled.queued_bytes,
+            settled.waiting_reservations,
+            settled.panicked_units_total
+        ),
+        (0, 0, 0, 1),
+        "{settled:?}"
+    );
+    assert!(callback.finished.load(Ordering::SeqCst) > 0);
+    for victim in &digests[..N / 2 - 1] {
+        assert_eq!(content_files_of(&dirs, *victim).await, Vec::<String>::new());
+    }
+    assert_eq!(
+        store.get_part_unchunked(written, 0, None).await?,
+        blob(N + 1).1
+    );
+    assert_eq!(POISONED_REPOLLS.load(Ordering::SeqCst), repolls_before);
+    Ok(())
+}
+
+// Per-waiter diagnostic port (nix-config 530c24d7): a retirement that waits
+// for the admission past the warning threshold is reported once per holder,
+// naming the waiter and the holder; that holder's release is reported too,
+// with the same operation id.
+#[nativelink_test]
+async fn a_long_admission_wait_is_reported_once_per_holder_with_its_release() -> Result<(), Error> {
+    use nativelink_util::store_trait::StoreKey;
+    const N: usize = 40;
+    const WAITING: &str =
+        "Filesystem retirement admission is still waiting; holder is a point-in-time snapshot";
+    const RELEASED: &str = "Reported filesystem retirement admission holder released";
+    let _serial = SERIAL.lock().await;
+    let dirs = dirs();
+    let store = open_store(&dirs, N * SIZE, N * SIZE / 2).await?;
+    let digests = fill(&store, N - 1).await?;
+    store.set_retirement_wait_warning_for_test(
+        Duration::from_millis(200),
+        Duration::from_millis(20),
+    );
+
+    // The first removal's rename holds the admission until released.
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+    let release_rx = std::sync::Mutex::new(Some(release_rx));
+    store.set_after_retire_rename_hook_for_test(Some(Arc::new(move || {
+        let entered = entered_tx.lock().unwrap().take();
+        if let Some(tx) = entered {
+            tx.send(()).unwrap();
+            let release = release_rx.lock().unwrap().take();
+            if let Some(rx) = release {
+                rx.recv().unwrap();
+            }
+        }
+    })));
+    let remove = |digest: DigestInfo| {
+        let map = store.get_evicting_map();
+        tokio::spawn(async move { map.remove(&StoreKey::Digest(digest)).await })
+    };
+    let holder = remove(digests[N - 2]);
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(WAIT))
+        .await
+        .expect("join")
+        .expect("the removal's rename reached its hook");
+    // Two more removals wait for the admission it holds.
+    let waiters = [remove(digests[N - 3]), remove(digests[N - 4])];
+
+    timeout(WAIT, async {
+        while !logs_contain(WAITING) {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("no waiting warning while the admission was held");
+    // Several more checks pass while the same holder still holds it.
+    sleep(Duration::from_millis(300)).await;
+    logs_assert(|lines: &[&str]| {
+        let warnings: Vec<&&str> = lines.iter().filter(|line| line.contains(WAITING)).collect();
+        if warnings.len() != 1 {
+            return Err(format!(
+                "{} waiting warnings for one holder",
+                warnings.len()
+            ));
+        }
+        let warning = warnings[0];
+        if !(warning.contains(" WARN ")
+            && warning.contains("operation_id=")
+            && (warning.contains("kind=Rename") || warning.contains("kind=Variant"))
+            && warning.contains("waited_ms=")
+            && warning.contains("holder=(")
+            && warning.contains("Rename"))
+        {
+            return Err(format!("incomplete waiting warning: {warning}"));
+        }
+        if lines.iter().any(|line| line.contains(RELEASED)) {
+            return Err("a release reported while the holder still held".to_string());
+        }
+        Ok(())
+    });
+    assert!(
+        !holder.is_finished(),
+        "the holder still holds when reported"
+    );
+
+    release_tx.send(()).unwrap();
+    assert!(
+        timeout(WAIT, holder)
+            .await
+            .expect("holder finished")
+            .expect("join")
+    );
+    for waiter in waiters {
+        assert!(
+            timeout(WAIT, waiter)
+                .await
+                .expect("waiter finished")
+                .expect("join")
+        );
+    }
+    timeout(WAIT, async {
+        while !logs_contain(RELEASED) {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the reported holder's release was not reported");
+    // The release names the holder the waiting warning named.
+    logs_assert(|lines: &[&str]| {
+        let named = |line: &str, prefix: &str| {
+            line.split(prefix)
+                .nth(1)
+                .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+                .map(str::to_string)
+        };
+        let warned = lines
+            .iter()
+            .find(|line| line.contains(WAITING))
+            .and_then(|line| named(line, "holder=("));
+        let released = lines
+            .iter()
+            .find(|line| line.contains(RELEASED))
+            .and_then(|line| named(line, "holder_operation_id="));
+        match (warned, released) {
+            (Some(warned), Some(released)) if warned == released && !warned.is_empty() => Ok(()),
+            other => Err(format!("warned and released holders differ: {other:?}")),
+        }
+    });
+    store.set_after_retire_rename_hook_for_test(None);
+    settle(&store).await;
+    let settled = store.retirement_accounting();
+    assert_eq!((settled.queued_units, settled.queued_bytes), (0, 0));
+    Ok(())
+}
+
+/// Holds the first `count` admitted retirement operations of `store` (of any
+/// kind), each until its release is sent; `entered` receives each one's index
+/// as it is held.
+fn hold_retirement_operations(
+    store: &Arc<FilesystemStore>,
+    count: usize,
+) -> (
+    std::sync::mpsc::Receiver<usize>,
+    Vec<std::sync::mpsc::Sender<()>>,
+) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<usize>();
+    let (releases, gates): (Vec<_>, Vec<_>) = (0..count)
+        .map(|_| {
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            (tx, Some(rx))
+        })
+        .unzip();
+    let gates = std::sync::Mutex::new(gates);
+    let entered_tx = std::sync::Mutex::new(entered_tx);
+    let next = core::sync::atomic::AtomicUsize::new(0);
+    store.set_before_retirement_operation_hook_for_test(Some(Arc::new(move || {
+        let index = next.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        let gate = gates.lock().unwrap().get_mut(index).and_then(Option::take);
+        if let Some(gate) = gate {
+            entered_tx.lock().unwrap().send(index).unwrap();
+            gate.recv().unwrap();
+        }
+    })));
+    (entered_rx, releases)
+}
+
+/// Pauses the store's waiting-retirement check once, right after it selects a
+/// waiter, once armed: `selected` is signalled and the check waits for
+/// `resume`.
+fn pause_waiter_selection_once(
+    store: &Arc<FilesystemStore>,
+) -> (
+    Arc<core::sync::atomic::AtomicBool>,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let armed = Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let (selected_tx, selected_rx) = std::sync::mpsc::channel::<()>();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+    let selected_tx = std::sync::Mutex::new(selected_tx);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    let hook_armed = armed.clone();
+    store.set_retirement_wait_selected_hook_for_test(Some(Arc::new(move || {
+        if hook_armed.swap(false, core::sync::atomic::Ordering::SeqCst) {
+            selected_tx.lock().unwrap().send(()).unwrap();
+            resume_rx.lock().unwrap().recv().unwrap();
+        }
+    })));
+    (armed, selected_rx, resume_tx)
+}
+
+const WAITING_WARNING: &str =
+    "Filesystem retirement admission is still waiting; holder is a point-in-time snapshot";
+
+/// (waiter operation id, holder operation id) of each waiting warning.
+fn waiting_warnings(lines: &[&str]) -> Vec<(u64, u64)> {
+    let number = |line: &str, prefix: &str| {
+        line.split(prefix)
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|digits| digits.parse::<u64>().ok())
+    };
+    lines
+        .iter()
+        .filter(|line| line.contains(WAITING_WARNING))
+        .map(|line| {
+            (
+                number(line, " operation_id=").expect("waiter id"),
+                number(line, "holder=(").expect("holder id"),
+            )
+        })
+        .collect()
+}
+
+/// Every waiting warning names a waiter admitted after its holder (the
+/// admission is FIFO and ids are taken on arrival), so never the holder itself
+/// or a waiter that was already gone; at most one per holder; and one names
+/// the given holder. A macro: `logs_assert` exists only in a test's body.
+macro_rules! assert_waiting_warnings_coherent {
+    ($holder:expr) => {{
+        let holder: u64 = $holder;
+        logs_assert(|lines: &[&str]| {
+            let warnings = waiting_warnings(lines);
+            if let Some(bad) = warnings.iter().find(|(waiter, holder)| waiter <= holder) {
+                return Err(format!(
+                    "a waiting warning names a stale or self waiter: {bad:?} in {warnings:?}"
+                ));
+            }
+            let mut holders: Vec<u64> = warnings.iter().map(|(_, holder)| *holder).collect();
+            holders.sort_unstable();
+            if holders.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(format!("two waiting warnings for one holder: {warnings:?}"));
+            }
+            if holders.contains(&holder) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "no waiting warning for holder {holder}: {warnings:?}"
+                ))
+            }
+        });
+    }};
+}
+
+/// The holder id of the `count`th waiting warning, once there is one. A macro:
+/// `logs_assert` exists only in a test's body.
+macro_rules! nth_waiting_holder {
+    ($count:expr) => {{
+        let count: usize = $count;
+        timeout(WAIT, async {
+            loop {
+                let found = core::cell::Cell::new(None);
+                logs_assert(|lines: &[&str]| {
+                    let warnings = waiting_warnings(lines);
+                    if warnings.len() >= count {
+                        found.set(Some(warnings[count - 1].1));
+                    }
+                    Ok(())
+                });
+                if let Some(holder) = found.get() {
+                    break holder;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("waiting warning")
+    }};
+}
+
+// DIAG-RACE-01 (review t_e5c79107): the selected waiter is admitted, and the
+// holder changes, in the gap after selection. No warning may name the
+// admitted waiter as waiting on itself, nor use up the new holder's one
+// warning: the real waiter behind the new holder is still reported.
+#[nativelink_test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_waiter_admitted_after_selection_is_not_reported_waiting_on_itself() -> Result<(), Error>
+{
+    use nativelink_util::store_trait::StoreKey;
+    const N: usize = 40;
+    let _serial = SERIAL.lock().await;
+    let dirs = dirs();
+    let store = open_store(&dirs, N * SIZE, N * SIZE / 2).await?;
+    let digests = fill(&store, N - 1).await?;
+    store.set_retirement_wait_warning_for_test(
+        Duration::from_millis(200),
+        Duration::from_millis(20),
+    );
+    let (entered, releases) = hold_retirement_operations(&store, 2);
+    let remove = |digest: DigestInfo| {
+        let map = store.get_evicting_map();
+        tokio::spawn(async move { map.remove(&StoreKey::Digest(digest)).await })
+    };
+    let first = remove(digests[N - 2]);
+    let entered = tokio::task::spawn_blocking(move || {
+        assert_eq!(entered.recv_timeout(WAIT), Ok(0), "the first holder");
+        entered
+    })
+    .await
+    .expect("join");
+    let second = remove(digests[N - 3]);
+    let first_holder = nth_waiting_holder!(1);
+
+    let (armed, selected, resume) = pause_waiter_selection_once(&store);
+    armed.store(true, core::sync::atomic::Ordering::SeqCst);
+    tokio::task::spawn_blocking(move || selected.recv_timeout(WAIT))
+        .await
+        .expect("join")
+        .expect("a waiter was selected");
+    // In the gap: the first holder releases, so the selected (longest, FIFO
+    // first) waiter is admitted and becomes the next holder.
+    releases[0].send(()).unwrap();
+    sleep(Duration::from_millis(300)).await;
+    resume.send(()).unwrap();
+    let entered = tokio::task::spawn_blocking(move || entered.recv_timeout(WAIT))
+        .await
+        .expect("join");
+    assert_eq!(entered, Ok(1), "the second holder");
+
+    let second_holder = nth_waiting_holder!(2);
+    assert_ne!(first_holder, second_holder);
+    assert_waiting_warnings_coherent!(second_holder);
+
+    releases[1].send(()).unwrap();
+    for task in [first, second] {
+        assert!(
+            timeout(WAIT, task)
+                .await
+                .expect("removal finished")
+                .expect("join")
+        );
+    }
+    store.set_before_retirement_operation_hook_for_test(None);
+    store.set_retirement_wait_selected_hook_for_test(None);
+    settle(&store).await;
+    assert_waiting_warnings_coherent!(second_holder);
+    Ok(())
+}
+
+// DIAG-RACE-01 (review t_e5c79107): the selected waiter is cancelled, and the
+// holder changes, in the gap after selection. The gone waiter may not be
+// reported, nor use up the new holder's one warning: the real waiter behind
+// the new holder is still reported.
+#[nativelink_test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_waiter_cancelled_after_selection_is_not_reported() -> Result<(), Error> {
+    use nativelink_util::store_trait::StoreKey;
+    const N: usize = 40;
+    let _serial = SERIAL.lock().await;
+    let dirs = dirs();
+    let store = open_store(&dirs, N * SIZE, N * SIZE / 2).await?;
+    let digests = fill(&store, N - 1).await?;
+    store.set_retirement_wait_warning_for_test(
+        Duration::from_millis(200),
+        Duration::from_millis(20),
+    );
+    let (entered, releases) = hold_retirement_operations(&store, 2);
+    let remove = |digest: DigestInfo| {
+        let map = store.get_evicting_map();
+        tokio::spawn(async move { map.remove(&StoreKey::Digest(digest)).await })
+    };
+    // The first removal's first operation (its variant) holds; the second
+    // removal's first operation waits, the only waiter.
+    let first = remove(digests[N - 2]);
+    let entered = tokio::task::spawn_blocking(move || {
+        assert_eq!(entered.recv_timeout(WAIT), Ok(0), "the first holder");
+        entered
+    })
+    .await
+    .expect("join");
+    let second = remove(digests[N - 3]);
+    let first_holder = nth_waiting_holder!(1);
+
+    let (armed, selected, resume) = pause_waiter_selection_once(&store);
+    armed.store(true, core::sync::atomic::Ordering::SeqCst);
+    tokio::task::spawn_blocking(move || selected.recv_timeout(WAIT))
+        .await
+        .expect("join")
+        .expect("a waiter was selected");
+    // In the gap: the selected waiter's removal is cancelled while it waits,
+    // then the first holder releases, and the first removal's next operation
+    // (its rename) arrives and can take the admission: a new holder.
+    second.abort();
+    sleep(Duration::from_millis(100)).await;
+    releases[0].send(()).unwrap();
+    sleep(Duration::from_millis(300)).await;
+    resume.send(()).unwrap();
+    let entered = tokio::task::spawn_blocking(move || entered.recv_timeout(WAIT))
+        .await
+        .expect("join");
+    assert_eq!(entered, Ok(1), "the second holder");
+    // A real waiter behind the second holder.
+    let third = remove(digests[N - 4]);
+
+    let second_holder = nth_waiting_holder!(2);
+    assert_ne!(first_holder, second_holder);
+    assert_waiting_warnings_coherent!(second_holder);
+
+    releases[1].send(()).unwrap();
+    let _cancelled = second.await;
+    for task in [first, third] {
+        assert!(
+            timeout(WAIT, task)
+                .await
+                .expect("removal finished")
+                .expect("join")
+        );
+    }
+    store.set_before_retirement_operation_hook_for_test(None);
+    store.set_retirement_wait_selected_hook_for_test(None);
+    settle(&store).await;
+    assert_waiting_warnings_coherent!(second_holder);
+    Ok(())
+}
