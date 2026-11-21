@@ -496,6 +496,10 @@ async fn temp_files_get_deleted_on_replace_test() -> Result<(), Error> {
 
     // Replace content.
     store.update_oneshot(digest1, VALUE2.into()).await?;
+    // The replaced generation is retired by the store's retirement drain,
+    // after the write has returned; looking before it settles raced it (this
+    // test failed three runs in six on the unchanged code).
+    store.retirement_settled_for_test().await;
 
     {
         // Replacing the content publishes a new generation, so re-discover it.
@@ -2411,6 +2415,10 @@ async fn evicting_digest_deletes_its_executable_variant() -> Result<(), Error> {
     // max_count: 1 means inserting a second digest evicts the first from the
     // primary evicting_map, which must also delete digest1's `.exec` sibling.
     store.update_oneshot(digest2, VALUE2.into()).await?;
+    // The eviction's cleanup runs on the store's retirement drain, after the
+    // write has returned; checking before it settles raced it (this test
+    // failed two runs in three on the unchanged code).
+    store.retirement_settled_for_test().await;
 
     let err = fs::metadata(&variant_path)
         .await
@@ -4191,6 +4199,9 @@ async fn startup_keeps_newest_generation_and_advances_counter() -> Result<(), Er
     );
     assert_eq!(list_file_names(&dir).await?, vec!["key-100"]);
     store.update_oneshot("key", VALUE1.into()).await?;
+    // `key-100` is retired by the store's retirement drain, after the write
+    // has returned.
+    store.retirement_settled_for_test().await;
     assert_eq!(list_file_names(&dir).await?, vec!["key-101"]);
     drop(store);
     wait_for_no_open_files().await?;
