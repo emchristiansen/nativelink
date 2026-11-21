@@ -2073,10 +2073,12 @@ fn small_blocking_pool_runtime(max_blocking_threads: usize) -> tokio::runtime::R
 }
 
 // RETIRE-BATCH-02: with the blocking pool busy, as on a worker running 256
-// actions, an eviction batch still drains quickly. Each submission to the
-// pool waits behind the other tasks queued there (here, about 3 ms); before
-// the repair the drain paid that wait once per evicted file, so 1,023
-// evictions took about 4 s, and now it pays it once per batch.
+// actions, an eviction batch still drains in a few pool round trips. Each
+// submission to the pool waits behind the other tasks queued there; before the
+// repair the drain paid that wait about twice per evicted entry (its rename and
+// its variant unlink), so 1,023 evictions took about 10 s here, and now it pays
+// it once per batch. The bound is in measured round trips of this pool, not
+// in seconds, so a slower machine raises both sides.
 #[test]
 fn an_eviction_batch_drains_quickly_while_the_blocking_pool_is_busy() -> Result<(), Error> {
     use core::sync::atomic::{AtomicBool, Ordering};
@@ -2084,9 +2086,7 @@ fn an_eviction_batch_drains_quickly_while_the_blocking_pool_is_busy() -> Result<
     const BLOCKING_THREADS: usize = 4;
     const LOAD_TASKS: usize = 12;
     const LOAD_SLEEP: Duration = Duration::from_millis(2);
-    // One round trip per evicted file takes over 2 s here; batched, well
-    // under 0.1 s.
-    const BOUND: Duration = Duration::from_millis(1500);
+    const PROBES: u32 = 20;
     let _serial = SERIAL.blocking_lock();
     let dirs = dirs();
     let runtime = small_blocking_pool_runtime(BLOCKING_THREADS);
@@ -2109,8 +2109,15 @@ fn an_eviction_batch_drains_quickly_while_the_blocking_pool_is_busy() -> Result<
                 })
             })
             .collect();
-        // Let the load fill the pool's queue.
+        // Let the load fill the pool's queue, then measure one round trip.
         sleep(Duration::from_millis(50)).await;
+        let probing = std::time::Instant::now();
+        for _ in 0..PROBES {
+            nativelink_util::spawn_blocking!("blocking_pool_probe", || ())
+                .await
+                .expect("probe");
+        }
+        let round_trip = probing.elapsed() / PROBES;
 
         write(&store, N).await?;
         let started = std::time::Instant::now();
@@ -2128,16 +2135,149 @@ fn an_eviction_batch_drains_quickly_while_the_blocking_pool_is_busy() -> Result<
         }
         assert_victims_retired(&store, &dirs, &digests, N).await?;
         let evicted = N / 2 - 1;
+        // Batched, the drain needs about evicted / 256 round trips plus the
+        // renames themselves; one or two per entry needed about 2 * evicted.
+        let bound_round_trips = u32::try_from(evicted / 8).expect("small");
+        let bound = round_trip * bound_round_trips;
         eprintln!(
-            "{evicted} evictions drained in {} ms under a busy blocking pool",
-            drained.as_millis()
+            "{evicted} evictions drained in {} ms under a busy blocking pool \
+             (round trip {} us, bound {} round trips = {} ms)",
+            drained.as_millis(),
+            round_trip.as_micros(),
+            bound_round_trips,
+            bound.as_millis()
         );
         assert!(
-            drained < BOUND,
-            "{evicted} evictions took {} ms to drain under a busy blocking pool (bound {} ms)",
+            drained < bound,
+            "{evicted} evictions took {} ms to drain under a busy blocking pool, \
+             over {bound_round_trips} round trips of {} us",
             drained.as_millis(),
-            BOUND.as_millis()
+            round_trip.as_micros()
         );
         Ok(())
     })
+}
+
+// RETIRE-BATCH-03 (review of PR 2): a panic part-way through a batch's
+// blocking closure (here from the after-rename test hook on the fifth
+// rename) is counted and logged with the entry it hit, whose bytes are
+// released once; the entries after it, never touched, go back to the queue
+// head with their bytes still owed, and the drain retires them. Before, the
+// remaining guards were dropped unrenamed, every entry of the batch was
+// reported retired with its bytes released, and nothing was counted.
+#[nativelink_test]
+async fn a_panic_mid_batch_is_counted_and_the_rest_retire() -> Result<(), Error> {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    const N: usize = 40;
+    const PANIC_AT: usize = 4;
+    let _serial = SERIAL.lock().await;
+    let dirs = dirs();
+    let store = open_store(&dirs, N * SIZE, N * SIZE / 2).await?;
+    let digests = fill(&store, N - 1).await?;
+    let renames = Arc::new(AtomicUsize::new(0));
+    store.set_after_retire_rename_hook_for_test(Some(Arc::new({
+        let renames = renames.clone();
+        move || {
+            assert_ne!(
+                renames.fetch_add(1, Ordering::SeqCst),
+                PANIC_AT,
+                "test rename hook panics mid-batch"
+            );
+        }
+    })));
+
+    write(&store, N).await?;
+    settle(&store).await;
+    store.set_after_retire_rename_hook_for_test(None);
+
+    let settled = store.retirement_accounting();
+    assert_eq!(
+        (
+            settled.queued_units,
+            settled.queued_bytes,
+            settled.panicked_units_total
+        ),
+        (0, 0, 1),
+        "{settled:?}"
+    );
+    // Every victim left the content directory: the panicked one was renamed
+    // before its hook ran, the rest by the batch or after their requeue.
+    let held = content_digests(&dirs).await;
+    for victim in &digests[..N / 2 - 1] {
+        assert!(
+            !held.contains(&victim.to_string()),
+            "{victim} still in content"
+        );
+    }
+    // Only the panicked entry's file is left in the temp directory (its new
+    // path was never recorded); the startup prune removes it.
+    eventually_async("deleted retired files", || async {
+        temp_files(&dirs).await.len() == 1
+    })
+    .await;
+    let panicked = digests[PANIC_AT];
+    assert!(logs_contain(
+        "Filesystem store retirement unit panicked; the drain abandons it and continues"
+    ));
+    assert!(logs_contain(&format!("{panicked}")));
+    assert!(logs_contain(
+        "Filesystem store retirement batch stopped early; its remaining unrefs are queued again"
+    ));
+    Ok(())
+}
+
+// Executable-variant record (review of PR 2): a variant kept because its
+// digest was resident again when an older removal's cleanup ran
+// (KeptForResidentGeneration) stays recorded, so the digest's later
+// eviction still deletes it.
+#[cfg(unix)]
+#[nativelink_test]
+async fn a_kept_variant_is_deleted_when_its_digest_is_later_evicted() -> Result<(), Error> {
+    use nativelink_util::store_trait::StoreKey;
+    const N: usize = 40;
+    let _serial = SERIAL.lock().await;
+    let dirs = dirs();
+    let store = open_store(&dirs, N * SIZE, N * SIZE / 2).await?;
+    let digests = fill(&store, N - 1).await?;
+    let digest = digests[0];
+    let variant_path = format!("{}.exec/{DIGEST_FOLDER_V2}/{digest}", dirs.content);
+    store.get_executable_hardlink_source(&digest).await?;
+    assert!(std::fs::metadata(&variant_path).is_ok(), "variant created");
+
+    // The removal's variant cleanup waits for the admission while the digest
+    // is uploaded again.
+    let admission = store.hold_retirement_admission_for_test().await;
+    let removal = nativelink_util::background_spawn!("removal", {
+        let map = store.get_evicting_map();
+        async move { map.remove(&StoreKey::Digest(digest)).await }
+    });
+    eventually("the variant cleanup to wait", || {
+        store.waiting_retirements_for_test() == 1
+    })
+    .await;
+    write(&store, 0).await?;
+    drop(admission);
+    assert!(
+        timeout(WAIT, removal)
+            .await
+            .expect("removal finished")
+            .expect("join")
+    );
+    settle(&store).await;
+    assert!(
+        std::fs::metadata(&variant_path).is_ok(),
+        "kept for the resident generation"
+    );
+
+    // Evicted later: the variant goes with it.
+    for index in N..3 * N {
+        write(&store, index).await?;
+    }
+    settle(&store).await;
+    assert_eq!(store.has(digest).await?, None, "the digest was evicted");
+    assert!(
+        std::fs::metadata(&variant_path).is_err(),
+        "the evicted digest's variant was deleted"
+    );
+    Ok(())
 }

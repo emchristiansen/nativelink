@@ -15,7 +15,7 @@
 use core::cmp;
 use core::fmt::{Debug, Display, Formatter};
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 use std::borrow::Cow;
 #[cfg(unix)]
@@ -1293,24 +1293,75 @@ impl<Fe: FileEntry> RetirementDrain<Fe> {
                 }
             };
             let units = core::mem::take(&mut self.current);
-            let count = units.len() as u64;
+            let mut count = units.len() as u64;
             match outcome {
-                Ok(Some(unrefed)) => {
+                Ok(Some(outcomes)) => {
                     let mut bytes: u64 = 0;
-                    for (unit, unrefed) in units.into_iter().zip(unrefed) {
-                        if let RetirementUnit::Unref(entry) = unit {
-                            bytes = bytes.saturating_add(entry.len());
-                            if !unrefed {
+                    let mut not_run = Vec::new();
+                    for (unit, outcome) in units.into_iter().zip(outcomes) {
+                        let RetirementUnit::Unref(entry) = unit else {
+                            continue;
+                        };
+                        match outcome {
+                            UnrefOutcome::Retired => {
+                                bytes = bytes.saturating_add(entry.len());
+                            }
+                            UnrefOutcome::Busy => {
+                                bytes = bytes.saturating_add(entry.len());
                                 self.queue.detach_unref(entry);
                             }
+                            UnrefOutcome::Panicked(message) => {
+                                // Its bytes are released there, once.
+                                self.abandon_panicked(
+                                    Some(&RetirementUnit::Unref(entry)),
+                                    Some(message.as_str()),
+                                    unit_started,
+                                );
+                            }
+                            UnrefOutcome::NotRun => not_run.push(RetirementUnit::Unref(entry)),
                         }
                     }
                     self.queue.release_queued(bytes);
                     unref_bytes = unref_bytes.saturating_add(bytes);
+                    if !not_run.is_empty() {
+                        // Never attempted: still owed, with their bytes, at
+                        // the head of the queue in their order.
+                        let requeued = not_run.len();
+                        count -= requeued as u64;
+                        let stalled = count == 0;
+                        {
+                            let mut state = self.queue.state.lock();
+                            for unit in not_run.into_iter().rev() {
+                                state.units.push_front(unit);
+                            }
+                        }
+                        if stalled {
+                            // Nothing in the batch ran (its blocking task
+                            // never started, e.g. at runtime shutdown).
+                            // Stop as a dropped drain does, so the next
+                            // enqueue or reservation starts a new one,
+                            // instead of retrying at once.
+                            warn!(
+                                store = %self.queue.content_path,
+                                requeued,
+                                "Filesystem store retirement batch did not run; its unrefs are queued again"
+                            );
+                            return;
+                        }
+                        warn!(
+                            store = %self.queue.content_path,
+                            requeued,
+                            "Filesystem store retirement batch stopped early; its remaining unrefs are queued again"
+                        );
+                    }
                 }
                 Err(panic) => {
+                    let message = panic
+                        .downcast_ref::<&str>()
+                        .map(|message| (*message).to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned());
                     for unit in &units {
-                        self.abandon_panicked(Some(unit), &*panic, unit_started);
+                        self.abandon_panicked(Some(unit), message.as_deref(), unit_started);
                     }
                 }
                 Ok(None) => {}
@@ -1340,13 +1391,9 @@ impl<Fe: FileEntry> RetirementDrain<Fe> {
     fn abandon_panicked(
         &self,
         unit: Option<&RetirementUnit<Fe>>,
-        panic: &(dyn core::any::Any + Send),
+        message: Option<&str>,
         unit_started: Instant,
     ) {
-        let message = panic
-            .downcast_ref::<&str>()
-            .map(|message| (*message).to_string())
-            .or_else(|| panic.downcast_ref::<String>().cloned());
         let (pending_unit, abandoned_bytes, unref_key) = match unit {
             Some(RetirementUnit::Callback(_)) => ("callback", 0, None),
             Some(RetirementUnit::Unref(entry)) => (
@@ -1545,6 +1592,23 @@ fn to_full_path_from_key(
     .into()
 }
 
+/// What [`FileEntry::try_unref_batch`] did with one entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnrefOutcome {
+    /// Retired: its file was renamed (or was already gone or already a temp
+    /// file), or the rename failed and was logged, as [`FileEntry::try_unref`]
+    /// does.
+    Retired,
+    /// A reader held its path lock; nothing was done to it.
+    Busy,
+    /// Its retirement panicked part-way; where its file is depends on how far
+    /// it got. The message names the failure.
+    Panicked(String),
+    /// Not attempted (an earlier entry of the batch panicked, or the batch's
+    /// blocking task never ran): nothing was done to it and it is still owed.
+    NotRun,
+}
+
 pub trait FileEntry: LenEntry + Send + Sync + Debug + 'static {
     /// Responsible for creating the underlying `FileEntry`.
     fn create(
@@ -1600,20 +1664,24 @@ pub trait FileEntry: LenEntry + Send + Sync + Debug + 'static {
     const BATCHES_UNREFS: bool = false;
 
     /// [`Self::try_unref`] for each of `entries`, all of one store, in order,
-    /// returning each one's result. The retirement drain uses it for a batch
-    /// of consecutive unrefs when [`Self::BATCHES_UNREFS`] is set. The default
-    /// runs them one after another; [`FileEntryImpl`] renames all the entries
-    /// it can lock in one admitted retirement operation.
-    fn try_unref_batch(entries: &[Arc<Self>]) -> impl Future<Output = Vec<bool>> + Send
+    /// returning one [`UnrefOutcome`] per entry. The retirement drain uses it
+    /// for a batch of consecutive unrefs when [`Self::BATCHES_UNREFS`] is set.
+    /// The default runs them one after another; [`FileEntryImpl`] renames all
+    /// the entries it can lock in one admitted retirement operation.
+    fn try_unref_batch(entries: &[Arc<Self>]) -> impl Future<Output = Vec<UnrefOutcome>> + Send
     where
         Self: Sized,
     {
         async move {
-            let mut unrefed = Vec::with_capacity(entries.len());
+            let mut outcomes = Vec::with_capacity(entries.len());
             for entry in entries {
-                unrefed.push(entry.try_unref().await);
+                outcomes.push(if entry.try_unref().await {
+                    UnrefOutcome::Retired
+                } else {
+                    UnrefOutcome::Busy
+                });
             }
-            unrefed
+            outcomes
         }
     }
 
@@ -1746,24 +1814,54 @@ impl FileEntry for FileEntryImpl {
         true
     }
 
-    /// Takes the path lock of each entry that no reader holds (the others
-    /// return `false`, untouched, as in [`Self::try_unref`]) and renames all
-    /// of their files in one admitted retirement operation, in order, each
-    /// entry's lock released as soon as its own rename is recorded.
-    async fn try_unref_batch(entries: &[Arc<Self>]) -> Vec<bool> {
-        let mut unrefed = Vec::with_capacity(entries.len());
-        let mut locked = Vec::with_capacity(entries.len());
-        for entry in entries {
-            match entry.encoded_file_path.try_write_arc() {
-                Some(encoded_file_path) => {
-                    locked.push(encoded_file_path);
-                    unrefed.push(true);
+    /// Renames the files of all of `entries` in one admitted retirement
+    /// operation, in order. Each entry's path lock is taken inside that
+    /// operation, without waiting, just before its rename, and released as
+    /// soon as the rename is recorded: an entry a reader holds is `Busy` and
+    /// untouched, as in [`Self::try_unref`], and an operation that never
+    /// starts locks nothing (every entry is `NotRun`).
+    async fn try_unref_batch(entries: &[Arc<Self>]) -> Vec<UnrefOutcome> {
+        // The store's context, from any entry no one is renaming. A shared
+        // lock taken and dropped at once: it never waits.
+        let Some(shared_context) = entries.iter().find_map(|entry| {
+            entry
+                .encoded_file_path
+                .try_read()
+                .map(|path| path.shared_context.clone())
+        }) else {
+            // Every entry's lock is held for writing, by retirements of
+            // their own: each is busy, as `try_unref` would find it.
+            return vec![UnrefOutcome::Busy; entries.len()];
+        };
+        let locks: Vec<_> = entries
+            .iter()
+            .map(|entry| entry.encoded_file_path.clone())
+            .collect();
+        let count = locks.len();
+        let progress = Arc::new(BatchProgress::default());
+        let renamed = shared_context
+            .retire_blocking(RetirementKind::Rename, {
+                let progress = progress.clone();
+                move || unref_batch_blocking(&locks, &progress)
+            })
+            .await;
+        retirement_detail("entry_after_rename");
+        match renamed {
+            Ok(outcomes) => outcomes,
+            Err(err) => {
+                // The operation panicked part-way, or never ran. The entries
+                // it finished are retired; the one it had started panicked;
+                // the rest were never touched.
+                let done = progress.done.lock().clone();
+                let started = progress.started.load(Ordering::Acquire);
+                let mut outcomes = done;
+                if started > outcomes.len() {
+                    outcomes.push(UnrefOutcome::Panicked(format!("{err:?}")));
                 }
-                None => unrefed.push(false),
+                outcomes.resize(count, UnrefOutcome::NotRun);
+                outcomes
             }
         }
-        unref_all_locked(locked).await;
-        unrefed
     }
 
     fn read_file_part(
@@ -2129,47 +2227,20 @@ impl LenEntry for FileEntryImpl {
 /// file is; a later `unref()` finds it already `Temp`. Readers wait for the
 /// guard, so no reader resolves the path between the rename and its record.
 async fn unref_locked(encoded_file_path: async_lock::RwLockWriteGuardArc<EncodedFilePath>) {
-    unref_all_locked(vec![encoded_file_path]).await;
-}
-
-/// [`unref_locked`] for several locked entries of one store: one admitted
-/// retirement operation renames their files in order, each guard moving with
-/// its rename and dropped once its new path is recorded. Its cancellation
-/// contract is `unref_locked`'s, for all of them at once: dropped before the
-/// closure starts, none is renamed and every entry still names its content
-/// file; once it runs, each entry names wherever its file is.
-async fn unref_all_locked(locked: Vec<async_lock::RwLockWriteGuardArc<EncodedFilePath>>) {
-    let locked: Vec<_> = locked
-        .into_iter()
-        .filter(|encoded_file_path| {
-            if encoded_file_path.path_type == PathType::Temp {
-                // Already retired: renamed by an earlier unref, possibly one
-                // whose caller was cancelled after the rename, or the rename
-                // into the content path failed.
-                debug!(
-                    key = ?encoded_file_path.key,
-                    "File is already a temp file",
-                );
-                return false;
-            }
-            true
-        })
-        .collect();
-    let Some(first) = locked.first() else {
+    if encoded_file_path.path_type == PathType::Temp {
+        // Already retired: renamed by an earlier unref, possibly one whose
+        // caller was cancelled after the rename, or the rename into the
+        // content path failed.
+        debug!(
+            key = ?encoded_file_path.key,
+            "File is already a temp file",
+        );
         return;
-    };
-    let shared_context = first.shared_context.clone();
-    debug_assert!(
-        locked
-            .iter()
-            .all(|path| Arc::ptr_eq(&path.shared_context, &shared_context)),
-        "a retirement batch holds entries of one store"
-    );
+    }
+    let shared_context = encoded_file_path.shared_context.clone();
     let renamed = shared_context
         .retire_blocking(RetirementKind::Rename, move || {
-            for encoded_file_path in locked {
-                rename_and_record(encoded_file_path);
-            }
+            rename_and_record(encoded_file_path);
         })
         .await;
     retirement_detail("entry_after_rename");
@@ -2178,6 +2249,49 @@ async fn unref_all_locked(locked: Vec<async_lock::RwLockWriteGuardArc<EncodedFil
         // the admission is closed. Whatever the closure did, it recorded.
         warn!(?err, "Retirement rename task did not report");
     }
+}
+
+/// How far a batch's blocking closure ([`unref_batch_blocking`]) got, read
+/// by its caller when the closure did not return (it panicked).
+#[derive(Debug, Default)]
+struct BatchProgress {
+    /// Entries the closure has started on.
+    started: AtomicUsize,
+    /// The outcomes of the entries it has finished, in order.
+    done: parking_lot::Mutex<Vec<UnrefOutcome>>,
+}
+
+/// The blocking body of [`FileEntryImpl::try_unref_batch`], run under the
+/// store's retirement admission: for each entry in order, takes its path
+/// lock without waiting (`Busy` if a reader holds it), and unless it is
+/// already a temp file renames its file and records the new path
+/// ([`rename_and_record`]), releasing the lock before the next entry. Each
+/// entry's start and outcome go into `progress` as it goes, so a panic
+/// part-way leaves a record of which entries were retired, which one
+/// panicked, and which were never touched.
+fn unref_batch_blocking(
+    locks: &[Arc<RwLock<EncodedFilePath>>],
+    progress: &BatchProgress,
+) -> Vec<UnrefOutcome> {
+    for lock in locks {
+        progress.started.fetch_add(1, Ordering::AcqRel);
+        let outcome = match lock.try_write_arc() {
+            None => UnrefOutcome::Busy,
+            Some(encoded_file_path) => {
+                if encoded_file_path.path_type == PathType::Temp {
+                    debug!(
+                        key = ?encoded_file_path.key,
+                        "File is already a temp file",
+                    );
+                } else {
+                    rename_and_record(encoded_file_path);
+                }
+                UnrefOutcome::Retired
+            }
+        };
+        progress.done.lock().push(outcome);
+    }
+    progress.done.lock().clone()
 }
 
 /// Renames the entry's content file into the temp directory and records the
