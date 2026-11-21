@@ -15,7 +15,7 @@
 use core::cmp;
 use core::fmt::{Debug, Display, Formatter};
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 use std::borrow::Cow;
 #[cfg(unix)]
@@ -563,6 +563,12 @@ impl SharedContext {
     /// releases it unrun. It takes no open-file permit: a rename or an unlink
     /// opens no file, and waiting for one while admitted could hold every
     /// retirement of the store behind the writers whose files it retires.
+    ///
+    /// One operation may rename several entries' files in a row (up to
+    /// [`RETIREMENT_RENAME_BATCH`], see [`FileEntry::try_unref_batch`]): it
+    /// still holds one thread and one admission, so the protections above
+    /// are unchanged, and the wait for the admission and for a blocking-pool
+    /// thread is paid once per batch instead of once per file.
     async fn retire_blocking<T: Send + 'static>(
         self: &Arc<Self>,
         kind: RetirementKind,
@@ -800,7 +806,9 @@ impl<Fe> RetirementState<Fe> {
 /// teardown for all of it, and every concurrent writer that queued behind it
 /// for the retirement admission. Here the cleanup is queued instead, and one
 /// drain task per store runs it, in order: each cleanup's remove callbacks,
-/// then its unrefs, as [`InsertCleanup`] runs them.
+/// then its unrefs, as [`InsertCleanup`] runs them. Consecutive unrefs run as
+/// one batch of up to `RETIREMENT_RENAME_BATCH` renames in one admitted
+/// operation; a batch never spans a remove callback, so the order is kept.
 ///
 /// Contracts:
 /// - Enqueueing cannot fail and does not wait. An entry is out of the map
@@ -870,6 +878,21 @@ pub struct RetirementAccounting {
 /// nothing above debug.
 const RETIREMENT_REPORT_EVERY: Duration = Duration::from_secs(10);
 
+/// The most consecutive `Unref` units a retirement drain renames in one
+/// admitted retirement operation, that is one blocking-pool task (see
+/// [`FileEntry::try_unref_batch`]).
+///
+/// One operation per unit made the drain pay a blocking-pool round trip per
+/// evicted file. On a busy worker (256 actions at once, all using the
+/// blocking pool) each submission waits behind other file operations, and
+/// the drain retired about 1,800 files a second, slower than they were
+/// inserted, while the renames themselves take microseconds. A batch pays
+/// that wait once for this many files. It also bounds how many evicted
+/// entries' path locks one operation holds, and so how long a reader of an
+/// evicted entry can wait behind the renames before its own: at most this
+/// many renames.
+const RETIREMENT_RENAME_BATCH: usize = 256;
+
 impl<Fe: FileEntry> RetirementQueue<Fe> {
     fn new(content_path: String, holder: RetirementHolderSlot) -> Self {
         Self {
@@ -924,7 +947,7 @@ impl<Fe: FileEntry> RetirementQueue<Fe> {
     fn spawn_drain(self: &Arc<Self>) {
         let drain = RetirementDrain {
             queue: self.clone(),
-            current: None,
+            current: Vec::new(),
             finished: false,
         };
         background_spawn!("filesystem_store_retirement_drain", drain.run());
@@ -1159,9 +1182,11 @@ impl<Fe> Drop for SpaceReservation<Fe> {
 /// The one task allowed to run a store's queued retirement, while it exists.
 struct RetirementDrain<Fe> {
     queue: Arc<RetirementQueue<Fe>>,
-    /// The unit being run. Taken off the queue, but put back at its head if
-    /// the drain is dropped before the unit has finished.
-    current: Option<RetirementUnit<Fe>>,
+    /// The units being run: one callback, or a batch of up to
+    /// [`RETIREMENT_RENAME_BATCH`] consecutive unrefs. Taken off the queue,
+    /// but put back at its head, in order, if the drain is dropped before
+    /// they have finished.
+    current: Vec<RetirementUnit<Fe>>,
     finished: bool,
 }
 
@@ -1198,27 +1223,47 @@ impl<Fe: FileEntry> RetirementDrain<Fe> {
                     self.report_caught_up(started, units_run, unref_bytes);
                     return;
                 };
-                self.current = Some(unit);
+                let batch = Fe::BATCHES_UNREFS && matches!(unit, RetirementUnit::Unref(_));
+                self.current.push(unit);
+                // Consecutive unrefs run as one batch; a callback runs alone,
+                // so the queue's order is kept.
+                while batch
+                    && self.current.len() < RETIREMENT_RENAME_BATCH
+                    && matches!(state.units.front(), Some(RetirementUnit::Unref(_)))
+                {
+                    self.current.extend(state.units.pop_front());
+                }
             }
             let unit_started = Instant::now();
             let outcome = {
-                // `self.current` stays in place while its unit runs, so a drain
-                // dropped meanwhile puts it back on the queue (see `Drop`).
-                let (pending_unit, unit) = match self.current.as_mut() {
-                    Some(RetirementUnit::Callback(callback)) => (
+                // `self.current` stays in place while its units run, so a
+                // drain dropped meanwhile puts them back on the queue (see
+                // `Drop`).
+                let (pending_unit, unit) = match self.current.as_mut_slice() {
+                    [RetirementUnit::Callback(callback)] => (
                         "callback",
                         futures::future::Either::Left(async move {
                             callback.as_mut().await;
                             None
                         }),
                     ),
-                    Some(RetirementUnit::Unref(entry)) => (
-                        "unref",
-                        futures::future::Either::Right(
-                            async move { Some(entry.try_unref().await) },
-                        ),
-                    ),
-                    None => unreachable!("a unit was just taken"),
+                    units => {
+                        let entries: Vec<Arc<Fe>> = units
+                            .iter()
+                            .map(|unit| match unit {
+                                RetirementUnit::Unref(entry) => entry.clone(),
+                                RetirementUnit::Callback(_) => {
+                                    unreachable!("a batch holds only unrefs")
+                                }
+                            })
+                            .collect();
+                        (
+                            "unref",
+                            futures::future::Either::Right(async move {
+                                Some(Fe::try_unref_batch(&entries).await)
+                            }),
+                        )
+                    }
                 };
                 // A unit whose future panics can never be polled again. Caught
                 // here, the drain abandons it and goes on to the units behind
@@ -1247,20 +1292,81 @@ impl<Fe: FileEntry> RetirementDrain<Fe> {
                     }
                 }
             };
-            let unit = self.current.take();
-            match (unit, outcome) {
-                (Some(RetirementUnit::Unref(entry)), Ok(Some(unrefed))) => {
-                    let bytes = entry.len();
-                    if !unrefed {
-                        self.queue.detach_unref(entry);
+            let units = core::mem::take(&mut self.current);
+            let mut count = units.len() as u64;
+            match outcome {
+                Ok(Some(outcomes)) => {
+                    let mut bytes: u64 = 0;
+                    let mut not_run = Vec::new();
+                    for (unit, outcome) in units.into_iter().zip(outcomes) {
+                        let RetirementUnit::Unref(entry) = unit else {
+                            continue;
+                        };
+                        match outcome {
+                            UnrefOutcome::Retired => {
+                                bytes = bytes.saturating_add(entry.len());
+                            }
+                            UnrefOutcome::Busy => {
+                                bytes = bytes.saturating_add(entry.len());
+                                self.queue.detach_unref(entry);
+                            }
+                            UnrefOutcome::Panicked(message) => {
+                                // Its bytes are released there, once.
+                                self.abandon_panicked(
+                                    Some(&RetirementUnit::Unref(entry)),
+                                    Some(message.as_str()),
+                                    unit_started,
+                                );
+                            }
+                            UnrefOutcome::NotRun => not_run.push(RetirementUnit::Unref(entry)),
+                        }
                     }
                     self.queue.release_queued(bytes);
                     unref_bytes = unref_bytes.saturating_add(bytes);
+                    if !not_run.is_empty() {
+                        // Never attempted: still owed, with their bytes, at
+                        // the head of the queue in their order.
+                        let requeued = not_run.len();
+                        count -= requeued as u64;
+                        let stalled = count == 0;
+                        {
+                            let mut state = self.queue.state.lock();
+                            for unit in not_run.into_iter().rev() {
+                                state.units.push_front(unit);
+                            }
+                        }
+                        if stalled {
+                            // Nothing in the batch ran (its blocking task
+                            // never started, e.g. at runtime shutdown).
+                            // Stop as a dropped drain does, so the next
+                            // enqueue or reservation starts a new one,
+                            // instead of retrying at once.
+                            warn!(
+                                store = %self.queue.content_path,
+                                requeued,
+                                "Filesystem store retirement batch did not run; its unrefs are queued again"
+                            );
+                            return;
+                        }
+                        warn!(
+                            store = %self.queue.content_path,
+                            requeued,
+                            "Filesystem store retirement batch stopped early; its remaining unrefs are queued again"
+                        );
+                    }
                 }
-                (unit, Err(panic)) => self.abandon_panicked(unit.as_ref(), &*panic, unit_started),
-                _ => {}
+                Err(panic) => {
+                    let message = panic
+                        .downcast_ref::<&str>()
+                        .map(|message| (*message).to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned());
+                    for unit in &units {
+                        self.abandon_panicked(Some(unit), message.as_deref(), unit_started);
+                    }
+                }
+                Ok(None) => {}
             }
-            units_run += 1;
+            units_run += count;
             if last_report.elapsed() >= self.queue.report_every() {
                 last_report = Instant::now();
                 self.queue
@@ -1285,13 +1391,9 @@ impl<Fe: FileEntry> RetirementDrain<Fe> {
     fn abandon_panicked(
         &self,
         unit: Option<&RetirementUnit<Fe>>,
-        panic: &(dyn core::any::Any + Send),
+        message: Option<&str>,
         unit_started: Instant,
     ) {
-        let message = panic
-            .downcast_ref::<&str>()
-            .map(|message| (*message).to_string())
-            .or_else(|| panic.downcast_ref::<String>().cloned());
         let (pending_unit, abandoned_bytes, unref_key) = match unit {
             Some(RetirementUnit::Callback(_)) => ("callback", 0, None),
             Some(RetirementUnit::Unref(entry)) => (
@@ -1350,7 +1452,7 @@ impl<Fe> Drop for RetirementDrain<Fe> {
             return;
         }
         let mut state = self.queue.state.lock();
-        if let Some(unit) = self.current.take() {
+        for unit in self.current.drain(..).rev() {
             state.units.push_front(unit);
         }
         state.draining = false;
@@ -1490,6 +1592,23 @@ fn to_full_path_from_key(
     .into()
 }
 
+/// What [`FileEntry::try_unref_batch`] did with one entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnrefOutcome {
+    /// Retired: its file was renamed (or was already gone or already a temp
+    /// file), or the rename failed and was logged, as [`FileEntry::try_unref`]
+    /// does.
+    Retired,
+    /// A reader held its path lock; nothing was done to it.
+    Busy,
+    /// Its retirement panicked part-way; where its file is depends on how far
+    /// it got. The message names the failure.
+    Panicked(String),
+    /// Not attempted (an earlier entry of the batch panicked, or the batch's
+    /// blocking task never ran): nothing was done to it and it is still owed.
+    NotRun,
+}
+
 pub trait FileEntry: LenEntry + Send + Sync + Debug + 'static {
     /// Responsible for creating the underlying `FileEntry`.
     fn create(
@@ -1532,6 +1651,37 @@ pub trait FileEntry: LenEntry + Send + Sync + Debug + 'static {
         async move {
             self.unref().await;
             true
+        }
+    }
+
+    /// Whether the retirement drain hands this type's consecutive unrefs to
+    /// [`Self::try_unref_batch`] in batches of up to
+    /// `RETIREMENT_RENAME_BATCH` (256). If not (the default), it runs each one
+    /// alone with [`Self::try_unref`], so a unit whose future panics is
+    /// abandoned alone (see [`RetirementQueue`]).
+    /// [`FileEntryImpl`] batches: its batch does its fallible work on the
+    /// blocking pool, where a panic is reported as a failed join instead.
+    const BATCHES_UNREFS: bool = false;
+
+    /// [`Self::try_unref`] for each of `entries`, all of one store, in order,
+    /// returning one [`UnrefOutcome`] per entry. The retirement drain uses it
+    /// for a batch of consecutive unrefs when [`Self::BATCHES_UNREFS`] is set.
+    /// The default runs them one after another; [`FileEntryImpl`] renames all
+    /// the entries it can lock in one admitted retirement operation.
+    fn try_unref_batch(entries: &[Arc<Self>]) -> impl Future<Output = Vec<UnrefOutcome>> + Send
+    where
+        Self: Sized,
+    {
+        async move {
+            let mut outcomes = Vec::with_capacity(entries.len());
+            for entry in entries {
+                outcomes.push(if entry.try_unref().await {
+                    UnrefOutcome::Retired
+                } else {
+                    UnrefOutcome::Busy
+                });
+            }
+            outcomes
         }
     }
 
@@ -1578,6 +1728,8 @@ impl FileEntryImpl {
 }
 
 impl FileEntry for FileEntryImpl {
+    const BATCHES_UNREFS: bool = true;
+
     fn create(
         data_size: u64,
         block_size: u64,
@@ -1660,6 +1812,56 @@ impl FileEntry for FileEntryImpl {
         };
         unref_locked(encoded_file_path).await;
         true
+    }
+
+    /// Renames the files of all of `entries` in one admitted retirement
+    /// operation, in order. Each entry's path lock is taken inside that
+    /// operation, without waiting, just before its rename, and released as
+    /// soon as the rename is recorded: an entry a reader holds is `Busy` and
+    /// untouched, as in [`Self::try_unref`], and an operation that never
+    /// starts locks nothing (every entry is `NotRun`).
+    async fn try_unref_batch(entries: &[Arc<Self>]) -> Vec<UnrefOutcome> {
+        // The store's context, from any entry no one is renaming. A shared
+        // lock taken and dropped at once: it never waits.
+        let Some(shared_context) = entries.iter().find_map(|entry| {
+            entry
+                .encoded_file_path
+                .try_read()
+                .map(|path| path.shared_context.clone())
+        }) else {
+            // Every entry's lock is held for writing, by retirements of
+            // their own: each is busy, as `try_unref` would find it.
+            return vec![UnrefOutcome::Busy; entries.len()];
+        };
+        let locks: Vec<_> = entries
+            .iter()
+            .map(|entry| entry.encoded_file_path.clone())
+            .collect();
+        let count = locks.len();
+        let progress = Arc::new(BatchProgress::default());
+        let renamed = shared_context
+            .retire_blocking(RetirementKind::Rename, {
+                let progress = progress.clone();
+                move || unref_batch_blocking(&locks, &progress)
+            })
+            .await;
+        retirement_detail("entry_after_rename");
+        match renamed {
+            Ok(outcomes) => outcomes,
+            Err(err) => {
+                // The operation panicked part-way, or never ran. The entries
+                // it finished are retired; the one it had started panicked;
+                // the rest were never touched.
+                let done = progress.done.lock().clone();
+                let started = progress.started.load(Ordering::Acquire);
+                let mut outcomes = done;
+                if started > outcomes.len() {
+                    outcomes.push(UnrefOutcome::Panicked(format!("{err:?}")));
+                }
+                outcomes.resize(count, UnrefOutcome::NotRun);
+                outcomes
+            }
+        }
     }
 
     fn read_file_part(
@@ -2047,6 +2249,49 @@ async fn unref_locked(encoded_file_path: async_lock::RwLockWriteGuardArc<Encoded
         // the admission is closed. Whatever the closure did, it recorded.
         warn!(?err, "Retirement rename task did not report");
     }
+}
+
+/// How far a batch's blocking closure ([`unref_batch_blocking`]) got, read
+/// by its caller when the closure did not return (it panicked).
+#[derive(Debug, Default)]
+struct BatchProgress {
+    /// Entries the closure has started on.
+    started: AtomicUsize,
+    /// The outcomes of the entries it has finished, in order.
+    done: parking_lot::Mutex<Vec<UnrefOutcome>>,
+}
+
+/// The blocking body of [`FileEntryImpl::try_unref_batch`], run under the
+/// store's retirement admission: for each entry in order, takes its path
+/// lock without waiting (`Busy` if a reader holds it), and unless it is
+/// already a temp file renames its file and records the new path
+/// ([`rename_and_record`]), releasing the lock before the next entry. Each
+/// entry's start and outcome go into `progress` as it goes, so a panic
+/// part-way leaves a record of which entries were retired, which one
+/// panicked, and which were never touched.
+fn unref_batch_blocking(
+    locks: &[Arc<RwLock<EncodedFilePath>>],
+    progress: &BatchProgress,
+) -> Vec<UnrefOutcome> {
+    for lock in locks {
+        progress.started.fetch_add(1, Ordering::AcqRel);
+        let outcome = match lock.try_write_arc() {
+            None => UnrefOutcome::Busy,
+            Some(encoded_file_path) => {
+                if encoded_file_path.path_type == PathType::Temp {
+                    debug!(
+                        key = ?encoded_file_path.key,
+                        "File is already a temp file",
+                    );
+                } else {
+                    rename_and_record(encoded_file_path);
+                }
+                UnrefOutcome::Retired
+            }
+        };
+        progress.done.lock().push(outcome);
+    }
+    progress.done.lock().clone()
 }
 
 /// Renames the entry's content file into the temp directory and records the
@@ -3073,6 +3318,9 @@ async fn publish_file<Fe: FileEntry>(
 ///   waiting to delete it, so such a reader takes the per-digest path, whose
 ///   caller populates the digest first.
 /// - A resident generation's own removal later retires the variant.
+/// - A digest with no recorded variant ([`ExecutableVariants`]) has nothing
+///   to delete: the callback returns under the lease, with no blocking-pool
+///   operation.
 ///
 /// Cancelled before its unlink starts, the callback deletes nothing: the
 /// variant stays until the digest's next removal or the startup wipe, and a
@@ -3083,6 +3331,7 @@ struct ExecutableVariantRemover<Fe: FileEntry> {
     content_path: String,
     shared_context: Arc<SharedContext>,
     executable_locks: Arc<ExecutableLocks>,
+    executable_variants: Arc<ExecutableVariants>,
     /// Weak because the map owns this callback.
     evicting_map: Weak<FsEvictingMap<'static, Fe>>,
 }
@@ -3114,7 +3363,16 @@ impl<Fe: FileEntry> RemoveItemCallback for ExecutableVariantRemover<Fe> {
             );
             retirement_detail("variant_lease");
             let lease = ExecutableVariantLease::acquire(&self.executable_locks, digest).await;
+            if !self.executable_variants.lock().contains(&digest) {
+                // No variant of this digest was materialized since the
+                // startup wipe, or its deletion has been recorded, and none
+                // can be materialized while this holds the lease: nothing to
+                // delete, so no blocking-pool operation (see
+                // [`ExecutableVariants`]).
+                return;
+            }
             let evicting_map = self.evicting_map.clone();
+            let executable_variants = self.executable_variants.clone();
             let retired = self
                 .shared_context
                 .retire_blocking(RetirementKind::Variant, {
@@ -3130,13 +3388,16 @@ impl<Fe: FileEntry> RemoveItemCallback for ExecutableVariantRemover<Fe> {
                         {
                             return Ok(VariantRetirement::KeptForResidentGeneration);
                         }
-                        match std::fs::remove_file(&variant_path) {
-                            Ok(()) => Ok(VariantRetirement::Deleted),
+                        let retirement = match std::fs::remove_file(&variant_path) {
+                            Ok(()) => VariantRetirement::Deleted,
                             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                                Ok(VariantRetirement::Absent)
+                                VariantRetirement::Absent
                             }
-                            Err(err) => Err(Error::from(err)),
-                        }
+                            Err(err) => return Err(Error::from(err)),
+                        };
+                        // Still under the lease, after the unlink.
+                        executable_variants.lock().remove(&digest);
+                        Ok(retirement)
                     }
                 })
                 .await
@@ -3198,6 +3459,9 @@ pub struct FilesystemStore<Fe: FileEntry = FileEntryImpl> {
     /// opened exactly once. See [`ExecutableVariantLease`].
     #[cfg(unix)]
     executable_locks: Arc<ExecutableLocks>,
+    /// See [`ExecutableVariants`].
+    #[cfg(unix)]
+    executable_variants: Arc<ExecutableVariants>,
     /// False when the startup wipe could not safely remove old executable
     /// variants from a read-only filesystem. Ordinary CAS reads remain
     /// available, but executable hardlink sources must not reuse stale files.
@@ -3210,6 +3474,24 @@ pub struct FilesystemStore<Fe: FileEntry = FileEntryImpl> {
 /// I/O.
 #[cfg(unix)]
 type ExecutableLocks = std::sync::Mutex<HashMap<DigestInfo, Arc<Mutex<()>>>>;
+
+/// The digests whose executable variant this store may have on disk: every
+/// digest whose variant it has materialized (or found on disk under the
+/// lease) since the startup wipe emptied the directory, less those whose
+/// variant its [`ExecutableVariantRemover`] has since deleted or found
+/// absent. A digest is added under its [`ExecutableVariantLease`] before a
+/// materialization can publish the file, and removed only under the lease
+/// after the unlink, so a digest that is not here has no variant on disk
+/// that this store made (one deleted from outside the store only leaves its
+/// digest here, costing one unlink that finds nothing).
+///
+/// It lets the remover skip the blocking-pool unlink for the evicted digests
+/// that never had a variant, nearly all of them: one blocking-pool round
+/// trip per evicted entry made the retirement drain fall behind on a busy
+/// worker (see [`RETIREMENT_RENAME_BATCH`]). Its size is bounded by the
+/// number of variants on disk.
+#[cfg(unix)]
+type ExecutableVariants = parking_lot::Mutex<std::collections::HashSet<DigestInfo>>;
 
 /// Exclusive right to materialize or delete one digest's executable variant.
 /// Materialization and [`ExecutableVariantRemover`] both hold it, and readers
@@ -3400,6 +3682,8 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         shared_context.watch_retirement_waiters();
         #[cfg(unix)]
         let executable_locks = Arc::<ExecutableLocks>::default();
+        #[cfg(unix)]
+        let executable_variants = Arc::<ExecutableVariants>::default();
 
         #[cfg(unix)]
         let executable_variants_enabled = {
@@ -3419,6 +3703,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
                         content_path: spec.content_path.clone(),
                         shared_context: shared_context.clone(),
                         executable_locks: executable_locks.clone(),
+                        executable_variants: executable_variants.clone(),
                         evicting_map: Arc::downgrade(&evicting_map),
                     },
                 )));
@@ -3485,6 +3770,8 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             flush_coalescer,
             #[cfg(unix)]
             executable_locks,
+            #[cfg(unix)]
+            executable_variants,
             #[cfg(unix)]
             executable_variants_enabled,
         }))
@@ -3834,6 +4121,11 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         // would each open a writer for the same executable — the very window
         // ETXTBSY exploits.
         let lease = ExecutableVariantLease::acquire(&self.executable_locks, *digest).await;
+        // Recorded under the lease before the variant can be published (or
+        // when it is found below), so the digest's next removal deletes it.
+        // A failed copy leaves the digest recorded; that removal then finds
+        // nothing to delete.
+        self.executable_variants.lock().insert(*digest);
 
         // Re-check: another task may have constructed it while we waited, and
         // no removal can be deleting it while we hold the lease.
