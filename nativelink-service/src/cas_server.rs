@@ -181,7 +181,12 @@ pub struct CasServer {
 type GetTreeStream = Pin<Box<dyn Stream<Item = Result<GetTreeResponse, Status>> + Send + 'static>>;
 
 /// Per-blob deadline applied inside `BatchReadBlobs` / `BatchUpdateBlobs`.
-const BATCH_PER_BLOB_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// 120 s rather than 30 s: on the workstation a burst of writes queues each
+/// blob behind a CAS write slot and an fsync, so even 142-byte blobs passed
+/// 30 s (train 442, 2026-11-21) and a whole build failed; a slow blob costs
+/// seconds, a failed build a full retest.
+const BATCH_PER_BLOB_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Maximum size of a single chunk accepted in a `SpliceBlob` request.
 /// Deliberately looser than the largest chunk the server ever advertises
