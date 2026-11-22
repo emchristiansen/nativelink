@@ -18862,8 +18862,8 @@ string is just the tombstone.
 | --- | --- | --- |
 | `Action timeout of N seconds is greater than the maximum allowed timeout of M seconds` | `InvalidArgument` | The client asked for longer than `max_action_timeout_s` (default 20 minutes). **Rejected outright, not clamped.** |
 | `Command '<cmd>' timed out after N seconds` | `DeadlineExceeded` | The action ran past its timeout and was killed. |
-| `BatchUpdateBlobs per-blob timeout (30 s) elapsed for digest <d>` | `DeadlineExceeded` | Fixed 30-second per-blob budget. Not configurable. |
-| `BatchReadBlobs per-blob timeout (30 s) elapsed for digest <d>` | `DeadlineExceeded` | Same. |
+| `BatchUpdateBlobs per-blob timeout (120 s) elapsed for digest <d>` | `DeadlineExceeded` | Fixed 120-second per-blob budget. Not configurable. |
+| `BatchReadBlobs per-blob timeout (120 s) elapsed for digest <d>` | `DeadlineExceeded` | Same. |
 | `Timeout waiting for previous operation cleanup` | `DeadlineExceeded` | The previous action's cleanup exceeded `max_cleanup_wait_s` (default 30 s). |
 
 The timeout defaults that matter: `max_action_timeout_s` 20 minutes,
