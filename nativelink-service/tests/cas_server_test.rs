@@ -813,9 +813,9 @@ async fn batch_update_blobs_per_blob_timeout_returns_deadline_exceeded()
 -> Result<(), Box<dyn core::error::Error>> {
     const VALUE: &str = "1";
 
-    // Stall longer than `BATCH_PER_BLOB_TIMEOUT` (30 s) so the
+    // Stall longer than `BATCH_PER_BLOB_TIMEOUT` (120 s) so the
     // per-blob timeout fires before the store ever resolves.
-    let cas_server = make_cas_server_with_stall_store(Duration::from_mins(2))?;
+    let cas_server = make_cas_server_with_stall_store(Duration::from_mins(5))?;
 
     let digest = Digest {
         hash: HASH1.to_string(),
@@ -854,7 +854,7 @@ async fn batch_update_blobs_per_blob_timeout_returns_deadline_exceeded()
 #[nativelink_test(start_paused = true)]
 async fn batch_read_blobs_per_blob_timeout_returns_deadline_exceeded()
 -> Result<(), Box<dyn core::error::Error>> {
-    let cas_server = make_cas_server_with_stall_store(Duration::from_mins(2))?;
+    let cas_server = make_cas_server_with_stall_store(Duration::from_mins(5))?;
 
     let digest = Digest {
         hash: HASH1.to_string(),
